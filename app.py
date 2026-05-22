@@ -60,6 +60,13 @@ except Exception:
     BOT_TOKEN = CHAT_ID = None
     telegram_ready = False
 
+try:
+    GROQ_API_KEY = st.secrets["groq"]["GROQ_API_KEY"]
+    groq_ready   = True
+except Exception:
+    GROQ_API_KEY = None
+    groq_ready   = False
+
 # ── Sell-signal set (used in success-rate & backtest direction logic) ─────────
 SELL_SIGNALS = {
     "📉 High<Low","📉 MACD賣出","📉 EMA賣出","📉 價格趨勢賣出","📉 價格趨勢賣出(量)",
@@ -3774,6 +3781,171 @@ with tabs[-1]:
                                       f"歷史均漲 {hs[best_hd]['平均漲幅']}%，"
                                       f"勝率 {hs[best_hd]['勝率']}%")
                     st.success(f"📱 已/將發送 Telegram｜{best_hd_rt}")
+
+        # ══════════════════════════════════════════════════════════════════════
+        #  🤖 AI 分析對話區（Groq llama-3.3-70b）
+        # ══════════════════════════════════════════════════════════════════════
+        st.divider()
+        st.markdown("### 🤖 AI 分析對話")
+        st.caption("回測數據已自動注入，直接問問題即可 · 由 Groq llama-3.3-70b 驅動")
+
+        if not groq_ready:
+            st.warning("⚠️ 請在 Streamlit secrets 加入 `[groq] GROQ_API_KEY = 'your_key'`")
+
+        # ── 語言選擇（唯一設定）──────────────────────────────────────────────
+        ai_lang = st.selectbox(
+            "回覆語言", ["繁體中文", "简体中文", "English"],
+            key="ai_lang"
+        )
+
+        # ── 自動生成回測摘要 ──────────────────────────────────────────────────
+        def _build_bt_summary(bt, ticker):
+            if not bt or bt.get("error"):
+                return f"{ticker} 尚未完成回測"
+            lines = [f"=== {ticker} 回測數據摘要 ==="]
+            lines.append(f"回測K線數: {bt.get('total_bars', 0)}")
+            lines.append(f"爆升點數量: {len(bt.get('surge_points', []))}")
+            pwr = bt.get("feature_power", [])
+            if pwr:
+                lines.append("\n【特徵預測力排行 Top5】")
+                for row in pwr[:5]:
+                    lines.append(f"  {row['特徵']}: {row['預測力倍數']}x (爆升前{row['爆升前出現率']}% vs 非爆升{row['非爆升出現率']}%)")
+            ps = bt.get("process_stats", {})
+            if ps:
+                lines.append("\n【過程特徵統計】")
+                for name, vals in ps.items():
+                    lines.append(f"  {name}: 爆升前{vals.get('爆升前出現率','N/A')} vs 非爆升{vals.get('非爆升出現率','N/A')}")
+            ls = bt.get("layer_stats", {})
+            if ls:
+                lines.append("\n【成交量分層爆升率】")
+                for layer, v in ls.items():
+                    lines.append(f"  {layer}: 爆升率{v['爆升率']}% ({v['爆升次數']}次)")
+            hs = bt.get("horizon_stats", {})
+            if hs:
+                lines.append("\n【最優持倉天數】")
+                for hd, v in hs.items():
+                    lines.append(f"  {hd}: 均漲{v['平均漲幅']}%, 勝率{v['勝率']}%")
+            rs = bt.get("regime_stats", {})
+            if rs:
+                lines.append("\n【大市環境分層】")
+                for regime, v in rs.items():
+                    lines.append(f"  {regime}: 爆升率{v['爆升率']}% ({v['爆升次數']}次)")
+            ei = bt.get("earnings_impact", {})
+            if ei:
+                lines.append(f"\n【財報週佔比】{ei.get('財報週佔比','N/A')}%")
+            tr = bt.get("train_result", {})
+            te = bt.get("test_result", {})
+            if tr and te:
+                lines.append(f"\n【訓練集】樣本{tr.get('樣本數',0)}, 量能遞進{tr.get('量能遞進','N/A')}, 底部抬升{tr.get('底部抬升','N/A')}")
+                lines.append(f"【測試集】樣本{te.get('樣本數',0)}, 量能遞進{te.get('量能遞進','N/A')}, 底部抬升{te.get('底部抬升','N/A')}")
+            return "\n".join(lines)
+
+        # ── 預設 Prompt 快捷按鈕 ──────────────────────────────────────────────
+        st.markdown("**💡 預設問題（一鍵發送）**")
+        preset_prompts = {
+            "📊 整體解讀":    "根據以上回測數據，幫我解讀 {ticker} 的爆升前信號特徵，哪些最可靠？哪些要小心？",
+            "🔍 最佳進場":    "根據回測數據，{ticker} 最佳的進場條件是什麼？請給出具體量化條件組合。",
+            "⚠️ 風險評估":    "根據回測數據，這套信號有哪些風險？什麼市場環境最容易失效？",
+            "📈 持倉策略":    "根據最優持倉天數和大市環境，幫我制定 {ticker} 的持倉和止損策略。",
+            "🔬 過擬合評估":  "訓練集和測試集的數據是否一致？這套規律是真實的還是歷史過擬合？",
+            "💰 實盤建議":    "如果要用這套系統實盤交易 {ticker}，資金管理和風控怎麼設置？",
+        }
+        btn_cols = st.columns(3)
+        for i, (label, tmpl) in enumerate(preset_prompts.items()):
+            with btn_cols[i % 3]:
+                if st.button(label, key=f"preset_{i}", use_container_width=True):
+                    st.session_state["ai_pending_prompt"] = tmpl.format(ticker=sp_ticker)
+
+        # ── 對話管理 ──────────────────────────────────────────────────────────
+        if "ai_chat_history" not in st.session_state:
+            st.session_state["ai_chat_history"] = []
+
+        if st.button("🗑️ 清空對話", key="ai_clear"):
+            st.session_state["ai_chat_history"] = []
+            st.session_state.pop("ai_pending_prompt", None)
+            st.rerun()
+
+        # ── 顯示對話歷史 ──────────────────────────────────────────────────────
+        for msg in st.session_state["ai_chat_history"]:
+            with st.chat_message(msg["role"], avatar="🤖" if msg["role"] == "assistant" else "👤"):
+                st.markdown(msg["content"])
+
+        # ── 輸入框 ────────────────────────────────────────────────────────────
+        pending    = st.session_state.pop("ai_pending_prompt", None)
+        user_input = st.chat_input("直接問 AI（回測數據已自動注入）", key="ai_chat_input")
+        final_input = pending or user_input
+
+        if final_input:
+            st.session_state["ai_chat_history"].append({"role": "user", "content": final_input})
+            with st.chat_message("user", avatar="👤"):
+                st.markdown(final_input)
+
+            # System prompt（含回測數據）
+            lang_map = {"繁體中文": "請用繁體中文回覆", "简体中文": "请用简体中文回复", "English": "Please reply in English"}
+            bt_summary = _build_bt_summary(st.session_state.get(f"sp_result_{sp_ticker}"), sp_ticker)
+            system_prompt = f"""你是一位專業的量化交易分析師，專注於股票量價信號分析。
+{lang_map.get(st.session_state.get("ai_lang","繁體中文"), "請用繁體中文回覆")}
+
+以下是 {sp_ticker} 的完整回測數據，請基於這些數據回答問題：
+
+{bt_summary}
+
+分析原則：基於數據說話，給出具體數字；指出優勢和局限；結合大市環境；提醒財報週特殊性；誠實評估過擬合風險。"""
+
+            api_messages = [{"role": m["role"], "content": m["content"]}
+                            for m in st.session_state["ai_chat_history"][:-1]]
+            api_messages.append({"role": "user", "content": final_input})
+
+            with st.chat_message("assistant", avatar="🤖"):
+                placeholder = st.empty()
+                full_reply  = ""
+                # Groq-only: key from secrets
+
+                if not groq_ready:
+                    full_reply = "⚠️ Groq API Key 未設定，請在 secrets.toml 加入 [groq] GROQ_API_KEY"
+                    placeholder.warning(full_reply)
+                else:
+                    try:
+                        headers = {
+                            "Authorization": f"Bearer {GROQ_API_KEY}",
+                            "Content-Type":  "application/json",
+                        }
+                        payload = {
+                            "model":       "llama-3.3-70b-versatile",
+                            "temperature": 0.3,
+                            "max_tokens":  2048,
+                            "stream":      True,
+                            "messages":    [
+                                {"role": "system", "content": system_prompt},
+                                *api_messages,
+                            ],
+                        }
+                        with requests.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers=headers, json=payload,
+                            stream=True, timeout=60
+                        ) as resp:
+                            if resp.status_code != 200:
+                                raise Exception(f"Groq API {resp.status_code}: {resp.text[:300]}")
+                            for line in resp.iter_lines():
+                                if not line:
+                                    continue
+                                s = line.decode("utf-8")
+                                if s.startswith("data: ") and s[6:].strip() != "[DONE]":
+                                    try:
+                                        delta = json.loads(s[6:])["choices"][0]["delta"].get("content", "")
+                                        full_reply += delta
+                                        placeholder.markdown(full_reply + "▌")
+                                    except Exception:
+                                        continue
+                        placeholder.markdown(full_reply)
+
+                    except Exception as e:
+                        full_reply = f"❌ Groq 調用失敗：{e}"
+                        placeholder.error(full_reply)
+
+                if full_reply:
+                    st.session_state["ai_chat_history"].append({"role": "assistant", "content": full_reply})
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  AUTO REFRESH（使用 @st.fragment 實現非阻塞自動刷新）
