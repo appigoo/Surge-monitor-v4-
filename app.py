@@ -1806,7 +1806,7 @@ with st.expander("⚡ 一鍵全部股票自動回測 & 更新 Telegram 條件表
             )
             st.balloons()
 
-tabs = st.tabs([f"📈 {t}" for t in selected_tickers] + ["🔬 回測分析"])
+tabs = st.tabs([f"📈 {t}" for t in selected_tickers] + ["🔬 回測分析", "📡 Screener選股", "📊 監控總覽"])
 
 
 # ── FIX BUG-03: Telegram 去重輔助函數 ─────────────────────────────────────────
@@ -3529,7 +3529,7 @@ def _build_surge_tg_msg(sig: dict, bt: dict) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 #  UI 渲染
 # ════════════════════════════════════════════════════════════════════════════
-with tabs[-1]:
+with tabs[-3]:
     st.markdown("## 🔬 爆升前特徵分析")
     st.caption("多股同時回測 → 找出個股爆升前獨有特徵 → 實時監控 → Telegram推送")
 
@@ -4034,6 +4034,734 @@ with tabs[-1]:
 #  AUTO REFRESH（使用 @st.fragment 實現非阻塞自動刷新）
 # ═════════════════════════════════════════════════════════════════════════════
 st.divider()
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  📡 Screener選股  +  📊 監控總覽
+# ═════════════════════════════════════════════════════════════════════════════
+
+_MEGA_UNIVERSE = [
+    "AAPL","MSFT","NVDA","GOOGL","AMZN","META","TSLA","AVGO","TSM","ORCL",
+    "ASML","CSCO","ADBE","AMD","QCOM","TXN","INTC","IBM","AMAT",
+    "JPM","V","MA","BAC","WFC","GS","MS","C","AXP","BLK",
+    "LLY","JNJ","UNH","ABBV","MRK","TMO","ABT","DHR","PFE","AMGN",
+    "WMT","COST","HD","MCD","KO","PEP","NKE","SBUX",
+    "XOM","CVX","COP","CAT","HON","RTX","BA",
+    "SPY","QQQ","IWM","XLK","GLD",
+]
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _sc_fetch(ticker: str):
+    try:
+        tk = yf.Ticker(ticker)
+        h  = tk.history(period="1y", interval="1d", timeout=10)
+        if h.empty or len(h) < 60:
+            return None, 0.0
+        mc = 0.0
+        try:
+            fi = tk.fast_info
+            v  = getattr(fi, "market_cap", None)
+            if v and v > 0:
+                mc = v / 1e9
+        except Exception:
+            pass
+        return h, mc
+    except Exception:
+        return None, 0.0
+
+def _sc_fundamental(hist):
+    try:
+        close = hist["Close"]
+        opens = hist["Open"]
+        rs_ok = False
+        try:
+            spy = yf.Ticker("SPY").history(period="90d", interval="1d")["Close"]
+            if not spy.empty and len(spy) >= 60:
+                stock_ret = (close.iloc[-1] / close.iloc[-60] - 1) * 100
+                spy_ret   = (spy.iloc[-1]   / spy.iloc[-60]   - 1) * 100
+                rs_ok     = stock_ret > spy_ret + 5
+        except Exception:
+            pass
+        prev_c = close.shift(1)
+        gap_up = False
+        for j in range(-30, -1):
+            try:
+                pv = prev_c.iloc[j]
+                if pv and pv > 0 and (opens.iloc[j] - pv) / pv * 100 >= 2.0:
+                    gap_up = True
+                    break
+            except Exception:
+                pass
+        wk52      = close.iloc[-252:].max() if len(close) >= 252 else close.max()
+        near_high = close.iloc[-1] >= wk52 * 0.92
+        score     = sum([rs_ok, gap_up, near_high])
+        return score >= 2, f"RS強:{rs_ok} | 跳空:{gap_up} | 近高:{near_high}"
+    except Exception as e:
+        return False, str(e)
+
+def _sc_vol_expansion(hist):
+    try:
+        close  = hist["Close"]
+        volume = hist["Volume"]
+        vol5   = volume.iloc[-5:].mean()
+        vol20  = volume.iloc[-20:].mean()
+        rvol   = vol5 / max(vol20, 1)
+        obv    = (pd.Series(np.sign(close.diff())) * volume).fillna(0).cumsum()
+        obv_rising = bool(obv.iloc[-1] > obv.iloc[-20])
+        price_up   = bool(close.iloc[-1] > close.iloc[-5])
+        score  = sum([rvol >= 1.5, obv_rising, price_up])
+        return score >= 2, f"RVOL:{rvol:.1f}x | OBV_up:{obv_rising} | 價升:{price_up}"
+    except Exception as e:
+        return False, str(e)
+
+def _sc_trend_accel(hist):
+    try:
+        close = hist["Close"]
+        high  = hist["High"]
+        low   = hist["Low"]
+        e10   = close.ewm(span=10,  adjust=False).mean()
+        e21   = close.ewm(span=21,  adjust=False).mean()
+        e50   = close.ewm(span=50,  adjust=False).mean()
+        e200  = close.ewm(span=200, adjust=False).mean()
+        ema_stack = bool(e10.iloc[-1] > e21.iloc[-1] > e50.iloc[-1] > e200.iloc[-1])
+        e12   = close.ewm(span=12, adjust=False).mean()
+        e26   = close.ewm(span=26, adjust=False).mean()
+        macd  = e12 - e26
+        sig_l = macd.ewm(span=9, adjust=False).mean()
+        macd_ok = bool(macd.iloc[-1] > sig_l.iloc[-1] and (macd - sig_l).iloc[-1] > 0)
+        prev_c  = close.shift(1)
+        tr      = pd.concat([(high-low),(high-prev_c).abs(),(low-prev_c).abs()],axis=1).max(axis=1)
+        atr     = tr.ewm(span=14, adjust=False).mean()
+        vcp     = bool(
+            atr.iloc[-5:].mean() < atr.iloc[-20:-5].mean() * 0.85
+            and close.iloc[-1] > close.iloc[-25:-5].max()
+        )
+        score = sum([ema_stack, macd_ok, vcp])
+        return score >= 2, f"EMA排列:{ema_stack} | MACD:{macd_ok} | VCP:{vcp}"
+    except Exception as e:
+        return False, str(e)
+
+def _sc_base_breakout(hist):
+    try:
+        close  = hist["Close"]
+        high   = hist["High"]
+        low    = hist["Low"]
+        volume = hist["Volume"]
+        prev_c = close.shift(1)
+        tr     = pd.concat([(high-low),(high-prev_c).abs(),(low-prev_c).abs()],axis=1).max(axis=1)
+        atr    = tr.ewm(span=14, adjust=False).mean()
+        atr_ok    = bool(atr.iloc[-20:].mean()    < atr.iloc[-40:-20].mean()    * 0.85)
+        vol_dry   = bool(volume.iloc[-20:].mean()  < volume.iloc[-40:-20].mean() * 0.90)
+        broke     = bool(close.iloc[-1]            > close.iloc[-65:-5].max())
+        vol_surge = bool(volume.iloc[-1]           > volume.iloc[-20:].mean()    * 1.5)
+        score  = sum([atr_ok, vol_dry, broke, vol_surge])
+        return score >= 3, f"ATR收:{atr_ok} | 量縮:{vol_dry} | 突破:{broke} | 量升:{vol_surge}"
+    except Exception as e:
+        return False, str(e)
+
+def _sc_scan_one(ticker, min_cap, use_fund, use_vol, use_trend, use_base):
+    hist, mc = _sc_fetch(ticker)
+    if hist is None or mc < min_cap:
+        return None
+    price   = float(hist["Close"].iloc[-1])
+    prev    = float(hist["Close"].iloc[-2])
+    chg_pct = (price - prev) / prev * 100
+    vol_r   = float(hist["Volume"].iloc[-5:].mean() / max(hist["Volume"].iloc[-20:].mean(), 1))
+    sigs = {}
+    cnt  = 0
+    if use_fund:
+        ok, det = _sc_fundamental(hist)
+        sigs["①業績質變"] = (ok, det)
+        cnt += ok
+    if use_vol:
+        ok, det = _sc_vol_expansion(hist)
+        sigs["②資金狂入"] = (ok, det)
+        cnt += ok
+    if use_trend:
+        ok, det = _sc_trend_accel(hist)
+        sigs["③趨勢加速"] = (ok, det)
+        cnt += ok
+    if use_base:
+        ok, det = _sc_base_breakout(hist)
+        sigs["④底部突破"] = (ok, det)
+        cnt += ok
+    enabled = sum([use_fund, use_vol, use_trend, use_base])
+    if enabled == 0 or cnt < 1:
+        return None
+    return {
+        "ticker": ticker, "price": price, "chg_pct": chg_pct,
+        "mc_b": mc, "vol_ratio": vol_r,
+        "signals": sigs, "sig_count": cnt, "enabled": enabled,
+    }
+
+def _sm_tg_msg(sig, bt, sc_sigs):
+    ticker   = sig["ticker"]
+    sc_lines = "\n".join(
+        "  {} {}: {}".format("✅" if v[0] else "❌", k, v[1][:60])
+        for k, v in sc_sigs.items()
+    ) if sc_sigs else "  （直接加入，無Screener記錄）"
+    pwr  = bt.get("feature_power", [])
+    top3 = ", ".join(f["特徵"] for f in pwr[:3]) if pwr else "N/A"
+    hs   = bt.get("horizon_stats", {})
+    bhd  = max(hs, key=lambda k: hs[k]["平均漲幅"], default="N/A") if hs else "N/A"
+    conds  = sig.get("conditions", [])
+    active = [c for c in conds if isinstance(c, dict) and c.get("active")]
+    clines = "\n".join(
+        "  {} {} ({})".format(
+            "✅" if c["passed"] else "❌",
+            c["text"].replace("✅ ", "").replace("❌ ", ""),
+            c["value"]
+        )
+        for c in active
+    )
+    wr  = hs.get(bhd, {}).get("勝率", "N/A")   if bhd != "N/A" else "N/A"
+    avg = hs.get(bhd, {}).get("平均漲幅", "N/A") if bhd != "N/A" else "N/A"
+    return (
+        "🚀 <b>智能選股雙重信號觸發</b>\n\n"
+        "🏷️ <b>{}</b>  |  {}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📡 <b>Screener 信號</b>\n{}\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "💰 <b>即時數據</b>\n"
+        "  現價: <b>${:.2f}</b>\n"
+        "  漲幅: <b>{:+.2f}%</b>\n"
+        "  量倍數: <b>{:.1f}x</b>\n\n"
+        "🎯 <b>爆升前特徵評分: {}/{}</b>\n{}\n"
+        "  最強特徵: {}\n\n"
+        "⏱️ <b>最優持倉</b>: {}\n"
+        "   均漲 {}%，勝率 {}%\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚠️ 基於個股回測，不構成投資建議"
+    ).format(
+        ticker, sig["time"].strftime("%Y-%m-%d %H:%M"),
+        sc_lines,
+        sig["price"], sig["ret"] * 100, sig["vol_ratio"],
+        sig["score"], sig["max_score"], clines, top3,
+        bhd, avg, wr
+    )
+
+
+# ── Session state init ────────────────────────────────────────────────────────
+for _sk, _sv in [
+    ("sm_queue",        []),
+    ("sm_bt_done",      {}),
+    ("sm_scan_results", []),
+    ("sm_mon_sigs",     {}),
+]:
+    if _sk not in st.session_state:
+        st.session_state[_sk] = _sv
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Tab: 📡 Screener選股
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[-2]:
+    st.markdown("## 📡 Screener 選股")
+    st.caption(
+        f"掃描 {len(_MEGA_UNIVERSE)} 隻大市值股票 | "
+        "找到信號後手動勾選確認加入回測隊列 | 支援直接輸入任意股票"
+    )
+
+    # ── 參數設定 ──────────────────────────────────────────────────────────────
+    with st.expander("⚙️ 參數設定", expanded=False):
+        _ep1, _ep2, _ep3 = st.columns(3)
+        with _ep1:
+            st.markdown("**Screener 條件**")
+            sm_min_cap   = st.slider("最低市值(十億$)", 50, 500, 100, 50, key="sm_min_cap")
+            sm_use_fund  = st.checkbox("① 業績質變（RS+跳空+近高）", value=True,  key="sm_uf")
+            sm_use_vol   = st.checkbox("② 資金狂入（RVOL+OBV+價升）", value=True,  key="sm_uv")
+            sm_use_trend = st.checkbox("③ 趨勢加速（EMA+MACD+VCP）",  value=True,  key="sm_ut")
+            sm_use_base  = st.checkbox("④ 底部突破（ATR+量縮+突破）", value=False, key="sm_ub")
+        with _ep2:
+            st.markdown("**回測參數**")
+            sm_period  = st.selectbox("回測年數", ["2y","3y","5y","10y"], index=2, key="sm_period")
+            sm_surge   = st.slider("爆升N天漲幅(%)",  5, 20, 10, 1, key="sm_surge")
+            sm_days    = st.slider("往後看幾天",       3, 15,  7, 1, key="sm_days")
+            sm_lb      = st.slider("往前看特徵天數",   3, 15,  7, 1, key="sm_lb")
+            sm_vol_win = st.slider("成交量均線窗口",  10, 30, 20, 1, key="sm_vol_win")
+        with _ep3:
+            st.markdown("**推送設定**")
+            sm_auto_tg = st.checkbox("觸發時自動發 Telegram", value=True, key="sm_auto_tg")
+            st.caption(
+                "觸發條件：\n"
+                "• 爆升前特徵評分 ≥ 65%\n"
+                "• 量倍數 ≥ 1.5x\n"
+                "• 量能遞進 或 底部抬升"
+            )
+
+    # ── 手動加入 ──────────────────────────────────────────────────────────────
+    st.markdown("### ➕ 手動加入任意股票")
+    _ha, _hb = st.columns([4, 1])
+    with _ha:
+        _manual_in = st.text_input(
+            "股票代號",
+            placeholder="單隻或逗號分隔，例：PLTR, COIN, MSTR",
+            key="sm_manual_in",
+            label_visibility="collapsed",
+        )
+    with _hb:
+        if st.button("加入回測隊列", key="sm_hadd",
+                     use_container_width=True, type="primary"):
+            _tks   = [t.strip().upper() for t in _manual_in.split(",") if t.strip()]
+            _added = []
+            for _t in _tks:
+                if (_t
+                        and _t not in st.session_state["sm_queue"]
+                        and _t not in st.session_state["sm_bt_done"]):
+                    st.session_state["sm_queue"].append(_t)
+                    _added.append(_t)
+            if _added:
+                st.success("✅ 已加入：{}".format(", ".join(_added)))
+            elif _tks:
+                st.info("股票已在隊列或已完成回測")
+
+    # 隊列快速狀態
+    _q   = st.session_state["sm_queue"]
+    _btd = st.session_state["sm_bt_done"]
+    if _q or _btd:
+        st.caption(
+            "待回測 ({})：{}　|　已回測 ({})：{}".format(
+                len(_q),   ", ".join(_q)                          or "空",
+                len(_btd), ", ".join(list(_btd.keys())[:6])       or "無",
+            )
+        )
+
+    st.divider()
+
+    # ── Screener 掃描 ─────────────────────────────────────────────────────────
+    st.markdown("### 🔍 自動掃描大市值股票")
+    _sa, _sb = st.columns([1, 3])
+    with _sa:
+        _do_scan = st.button("🔍 開始掃描", type="primary",
+                             use_container_width=True, key="sm_do_scan")
+    with _sb:
+        _lt = st.session_state.get("sm_last_scan_time")
+        if _lt:
+            st.caption(
+                "上次掃描：{}  |  結果：{} 隻".format(
+                    _lt, len(st.session_state["sm_scan_results"])
+                )
+            )
+        else:
+            st.caption("尚未掃描，按左側按鈕開始")
+
+    if _do_scan:
+        _prog = st.progress(0, text="掃描中...")
+        _res  = []
+        for _i, _tk in enumerate(_MEGA_UNIVERSE):
+            _prog.progress(
+                (_i + 1) / len(_MEGA_UNIVERSE),
+                text="掃描 {}（{}/{}）...".format(_tk, _i + 1, len(_MEGA_UNIVERSE))
+            )
+            _r = _sc_scan_one(
+                _tk,
+                st.session_state.get("sm_min_cap",  100),
+                st.session_state.get("sm_uf",   True),
+                st.session_state.get("sm_uv",   True),
+                st.session_state.get("sm_ut",   True),
+                st.session_state.get("sm_ub",   False),
+            )
+            if _r:
+                _res.append(_r)
+        _prog.empty()
+        _res.sort(key=lambda x: x["sig_count"], reverse=True)
+        st.session_state["sm_scan_results"]   = _res
+        st.session_state["sm_last_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        st.success("✅ 掃描完成：{} 隻有信號，請勾選後確認加入回測".format(len(_res)))
+        st.rerun()
+
+    # ── 掃描結果：手動勾選確認 ───────────────────────────────────────────────
+    _scan_res = st.session_state.get("sm_scan_results", [])
+    if _scan_res:
+        st.markdown("### 掃描結果（{} 隻）".format(len(_scan_res)))
+
+        # 統計列
+        _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+        _mc1.metric("有信號", len(_scan_res))
+        _mc2.metric("全信號命中", sum(1 for r in _scan_res if r["sig_count"] == r["enabled"]))
+        _mc3.metric("已在隊列", sum(1 for r in _scan_res
+                                    if r["ticker"] in st.session_state["sm_queue"]))
+        _mc4.metric("已回測",   sum(1 for r in _scan_res
+                                    if r["ticker"] in st.session_state["sm_bt_done"]))
+
+        # 按信號數分組顯示，逐行勾選
+        _max_sig  = max(r["sig_count"] for r in _scan_res)
+        _selected = []
+
+        for _sn in range(_max_sig, 0, -1):
+            _group = [r for r in _scan_res if r["sig_count"] == _sn]
+            if not _group:
+                continue
+            _enabled = _group[0]["enabled"]
+            st.markdown(
+                "**{stars} {n}/{e} 信號命中 — {cnt} 隻**".format(
+                    stars="⭐" * _sn, n=_sn, e=_enabled, cnt=len(_group)
+                )
+            )
+
+            for _r in _group:
+                _tk   = _r["ticker"]
+                _done = _tk in st.session_state["sm_bt_done"]
+                _inq  = _tk in st.session_state["sm_queue"]
+                _status = "✅已回測" if _done else "📋隊列中" if _inq else ""
+
+                _ck, _ci, _cs, _cst = st.columns([0.5, 2, 4, 1.5])
+                with _ck:
+                    _chk = st.checkbox(
+                        "", key="sm_chk_{}".format(_tk),
+                        value=False, disabled=_done or _inq
+                    )
+                with _ci:
+                    _clr = "#00d4aa" if _r["chg_pct"] > 0 else "#ff4560"
+                    st.markdown(
+                        "<b style='font-size:15px'>{tk}</b> "
+                        "<span style='color:{clr}'>{chg:+.2f}%</span> "
+                        "<span style='color:#5a6580;font-size:12px'>"
+                        "${px:.2f} | ${mc:.0f}B</span>".format(
+                            tk=_tk, clr=_clr,
+                            chg=_r["chg_pct"],
+                            px=_r["price"], mc=_r["mc_b"]
+                        ),
+                        unsafe_allow_html=True
+                    )
+                with _cs:
+                    _badges = " ".join(
+                        "<span style='background:{bg};color:{fc};"
+                        "padding:2px 8px;border-radius:10px;font-size:11px'>"
+                        "{ic} {k}</span>".format(
+                            bg="rgba(0,212,170,0.15)" if v[0] else "rgba(255,69,96,0.1)",
+                            fc="#00d4aa" if v[0] else "#ff4560",
+                            ic="✅" if v[0] else "❌",
+                            k=k
+                        )
+                        for k, v in _r["signals"].items()
+                    )
+                    st.markdown(
+                        "{} <span style='color:#5a6580;font-size:11px'>量{:.1f}x</span>".format(
+                            _badges, _r["vol_ratio"]
+                        ),
+                        unsafe_allow_html=True
+                    )
+                with _cst:
+                    if _status:
+                        st.caption(_status)
+                if _chk:
+                    _selected.append(_tk)
+
+        # 確認加入按鈕
+        if _selected:
+            st.markdown("---")
+            if st.button(
+                "✅ 確認加入回測隊列（{} 隻）：{}".format(
+                    len(_selected), ", ".join(_selected)
+                ),
+                type="primary", key="sm_confirm_add", use_container_width=True
+            ):
+                _newly = []
+                for _t in _selected:
+                    if (_t not in st.session_state["sm_queue"]
+                            and _t not in st.session_state["sm_bt_done"]):
+                        st.session_state["sm_queue"].append(_t)
+                        _newly.append(_t)
+                if _newly:
+                    st.success(
+                        "✅ 已加入：{}，切換到【📊 監控總覽】執行回測".format(
+                            ", ".join(_newly)
+                        )
+                    )
+                st.rerun()
+
+        # 信號詳情展開
+        with st.expander("📋 各股信號詳情"):
+            for _r in _scan_res:
+                st.markdown("**{}** — {}/{} 信號".format(
+                    _r["ticker"], _r["sig_count"], _r["enabled"]
+                ))
+                for _k, (_ok, _det) in _r["signals"].items():
+                    st.caption("  {} {}: {}".format("✅" if _ok else "❌", _k, _det))
+                st.divider()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Tab: 📊 監控總覽
+# ════════════════════════════════════════════════════════════════════════════
+with tabs[-1]:
+    st.markdown("## 📊 監控總覽")
+    st.caption("執行回測 → 手動掃描 → 條件達標自動發送 Telegram")
+
+    _bt_done  = st.session_state["sm_bt_done"]
+    _mon_sigs = st.session_state["sm_mon_sigs"]
+    _queue    = st.session_state["sm_queue"]
+
+    # ── 回測隊列管理 ──────────────────────────────────────────────────────────
+    with st.expander(
+        "🔬 回測隊列（待回測：{} | 已回測：{}）".format(len(_queue), len(_bt_done)),
+        expanded=len(_queue) > 0
+    ):
+        _qa, _qb, _qc = st.columns([2, 1, 1])
+        with _qa:
+            if _queue:
+                st.info("待回測：{}".format(", ".join(_queue)))
+            else:
+                st.caption("回測隊列為空，請在【📡 Screener選股】加入股票")
+        with _qb:
+            _do_bt = st.button("▶ 執行回測", type="primary",
+                               use_container_width=True, key="sm_mon_bt")
+        with _qc:
+            if st.button("🗑️ 清空已回測", use_container_width=True, key="sm_mon_clear"):
+                st.session_state["sm_bt_done"]  = {}
+                st.session_state["sm_mon_sigs"] = {}
+                st.rerun()
+
+        if _do_bt and _queue:
+            _bprog = st.progress(0)
+            for _i, _tk in enumerate(list(_queue)):
+                _bprog.progress(
+                    _i / len(_queue),
+                    text="回測 {}（{}/{}）...".format(_tk, _i + 1, len(_queue))
+                )
+                _bt = _surge_backtest(
+                    _tk,
+                    st.session_state.get("sm_period",  "5y"),
+                    st.session_state.get("sm_surge",   10),
+                    st.session_state.get("sm_days",    7),
+                    st.session_state.get("sm_lb",      7),
+                    0.7,
+                    st.session_state.get("sm_vol_win", 20),
+                )
+                st.session_state["sm_bt_done"][_tk] = _bt
+            st.session_state["sm_queue"] = []
+            _bprog.progress(1.0, text="✅ 回測完成！")
+            st.rerun()
+
+        if _bt_done:
+            _del_t = st.selectbox("移除股票", ["—"] + list(_bt_done.keys()), key="sm_del_mon")
+            if _del_t != "—" and st.button("移除", key="sm_do_del_mon"):
+                del st.session_state["sm_bt_done"][_del_t]
+                st.session_state["sm_mon_sigs"].pop(_del_t, None)
+                st.rerun()
+
+    if not _bt_done:
+        st.info("📭 尚無已回測股票。請先在【📡 Screener選股】找到股票，完成回測後返回此頁。")
+    else:
+        # ── 監控操作列 ────────────────────────────────────────────────────────
+        st.divider()
+        _oa, _ob, _oc = st.columns([1, 1, 3])
+        with _oa:
+            _scan_all = st.button("🔍 全部立即掃描", type="primary",
+                                  use_container_width=True, key="sm_scan_all")
+        with _ob:
+            _atg = st.checkbox(
+                "觸發自動發TG",
+                value=st.session_state.get("sm_auto_tg", True),
+                key="sm_mon_atg"
+            )
+        with _oc:
+            _triggered    = [t for t, s in _mon_sigs.items() if s.get("triggered")]
+            _last_mon     = st.session_state.get("sm_last_mon_time", "—")
+            if _triggered:
+                st.error("🚨 已觸發：{}".format(", ".join(_triggered)))
+            else:
+                st.caption(
+                    "監控 {} 隻 | 上次掃描：{} | 目前無觸發".format(
+                        len(_bt_done), _last_mon
+                    )
+                )
+
+        # 全部掃描
+        if _scan_all:
+            _vw    = st.session_state.get("sm_vol_win", 20)
+            _mprog = st.progress(0)
+            _dlist = list(_bt_done.keys())
+            for _i, _tk in enumerate(_dlist):
+                _mprog.progress(_i / len(_dlist), text="掃描 {}...".format(_tk))
+                _bt  = _bt_done[_tk]
+                _pwr = _bt.get("feature_power", [])
+                _sig = _realtime_check(_tk, _bt, _pwr, _vw)
+                st.session_state["sm_mon_sigs"][_tk] = _sig
+                if _atg and _sig.get("triggered") and not _sig.get("error"):
+                    _sk = "sm_{}_{}".format(_tk, _sig["time"].strftime("%Y%m%d%H%M"))
+                    if _sk not in st.session_state.get("sent_signals", set()):
+                        _sc = next(
+                            (r["signals"] for r in st.session_state.get("sm_scan_results", [])
+                             if r["ticker"] == _tk),
+                            {}
+                        )
+                        _ok2, _ = send_telegram_alert(_sm_tg_msg(_sig, _bt, _sc), _tk)
+                        if _ok2:
+                            st.session_state.setdefault("sent_signals", set()).add(_sk)
+                            st.toast("📱 {} 已發送".format(_tk))
+            _mprog.progress(1.0, text="✅ 掃描完成")
+            st.session_state["sm_last_mon_time"] = datetime.now().strftime("%H:%M:%S")
+            st.rerun()
+
+        # ── 已回測摘要表 ──────────────────────────────────────────────────────
+        st.markdown("### 📋 已回測股票摘要")
+        _brows = []
+        for _t, _bt in _bt_done.items():
+            _sig = _mon_sigs.get(_t)
+            _pwr = _bt.get("feature_power", [])
+            _hs  = _bt.get("horizon_stats", {})
+            _bhd = max(_hs, key=lambda k: _hs[k]["平均漲幅"], default="N/A") if _hs else "N/A"
+            _sc_info = next(
+                ("{}/{}信號".format(r["sig_count"], r["enabled"])
+                 for r in st.session_state.get("sm_scan_results", [])
+                 if r["ticker"] == _t),
+                "手動加入"
+            )
+            _brows.append({
+                "股票":     _t,
+                "來源":     _sc_info,
+                "爆升點":   len(_bt.get("surge_points", [])) if not _bt.get("error") else "❌",
+                "最強特徵": "{}({:.1f}x)".format(_pwr[0]["特徵"][:16], _pwr[0]["預測力倍數"]) if _pwr else "N/A",
+                "最優持倉": _bhd,
+                "最優勝率": "{}%".format(_hs.get(_bhd, {}).get("勝率", "N/A")) if _bhd != "N/A" else "N/A",
+                "上次評分": "{}/{}".format(_sig["score"], _sig["max_score"]) if (_sig and not _sig.get("error")) else "—",
+                "狀態":     "🚨觸發" if (_sig and _sig.get("triggered")) else "⚪監控中" if _sig else "未掃描",
+            })
+        st.dataframe(pd.DataFrame(_brows), use_container_width=True, hide_index=True)
+
+        # ── 信號卡片（每行3個）────────────────────────────────────────────────
+        st.markdown("### 📡 即時信號卡片")
+        _dlist = list(_bt_done.keys())
+        _vw    = st.session_state.get("sm_vol_win", 20)
+        _atg   = st.session_state.get("sm_mon_atg", True)
+
+        for _rs in range(0, len(_dlist), 3):
+            _rtks = _dlist[_rs:_rs + 3]
+            _cols = st.columns(len(_rtks))
+            for _col, _tk in zip(_cols, _rtks):
+                with _col:
+                    _bt  = _bt_done[_tk]
+                    _sig = _mon_sigs.get(_tk)
+
+                    if st.button("🔍 {}".format(_tk), key="sm_card_{}".format(_tk),
+                                 use_container_width=True):
+                        _pwr = _bt.get("feature_power", [])
+                        _sig = _realtime_check(_tk, _bt, _pwr, _vw)
+                        st.session_state["sm_mon_sigs"][_tk] = _sig
+                        if _atg and _sig.get("triggered") and not _sig.get("error"):
+                            _sk = "sm_{}_{}".format(_tk, _sig["time"].strftime("%Y%m%d%H%M"))
+                            if _sk not in st.session_state.get("sent_signals", set()):
+                                _sc = next(
+                                    (r["signals"] for r in st.session_state.get("sm_scan_results", [])
+                                     if r["ticker"] == _tk),
+                                    {}
+                                )
+                                _ok2, _ = send_telegram_alert(_sm_tg_msg(_sig, _bt, _sc), _tk)
+                                if _ok2:
+                                    st.session_state.setdefault("sent_signals", set()).add(_sk)
+                                    st.toast("📱 {} 已發送".format(_tk))
+
+                    if _sig is None:
+                        _pwr  = _bt.get("feature_power", [])
+                        _hs   = _bt.get("horizon_stats", {})
+                        _bhd  = max(_hs, key=lambda k: _hs[k]["平均漲幅"], default="") if _hs else ""
+                        _src  = next(
+                            ("Screener {}/{}信號".format(r["sig_count"], r["enabled"])
+                             for r in st.session_state.get("sm_scan_results", [])
+                             if r["ticker"] == _tk),
+                            "手動加入"
+                        )
+                        st.markdown(
+                            "<div style='background:#161b27;border:1px solid #1e2535;"
+                            "border-radius:8px;padding:12px'>"
+                            "<b>⚪ {tk}</b><br>"
+                            "<span style='font-size:11px;color:#7c5cfc'>{src}</span><br>"
+                            "<span style='font-size:11px;color:#5a6580'>最強: {feat}</span><br>"
+                            "<span style='font-size:11px;color:#5a6580'>持倉: {hd}</span><br>"
+                            "<span style='font-size:11px;color:#00d4aa'>↑ 點擊掃描</span>"
+                            "</div>".format(
+                                tk=_tk, src=_src,
+                                feat=_pwr[0]["特徵"][:18] if _pwr else "N/A",
+                                hd=_bhd,
+                            ),
+                            unsafe_allow_html=True
+                        )
+                        continue
+
+                    if _sig.get("error"):
+                        st.warning("⚠️ {}".format(_sig["error"]))
+                        continue
+
+                    _score = _sig["score"]
+                    _maxs  = _sig["max_score"]
+                    _pct   = int(_score / max(_maxs, 1) * 100)
+                    _trig  = _sig["triggered"]
+                    _bc = "#00d4aa" if _trig else "#ffd166" if _pct >= 50 else "#5a6580"
+                    _bd = "#00d4aa" if _trig else "#ffd166" if _pct >= 50 else "#2a3040"
+                    _bg = "rgba(0,212,170,0.1)" if _trig else "rgba(255,209,102,0.05)" if _pct >= 50 else "#161b27"
+                    _ic = "🚨" if _trig else "🟡" if _pct >= 50 else "⚪"
+
+                    _conds  = _sig.get("conditions", [])
+                    _active = [c for c in _conds if isinstance(c, dict) and c.get("active")]
+                    _chtml  = "".join(
+                        "<div style='font-size:11px;padding:1px 0;color:{fc}'>"
+                        "{ic} {txt} "
+                        "<span style='color:#5a6580'>({val})</span></div>".format(
+                            fc="#00d4aa" if c["passed"] else "#ff4560",
+                            ic="✅" if c["passed"] else "❌",
+                            txt=c["text"].replace("✅ ", "").replace("❌ ", ""),
+                            val=c["value"],
+                        )
+                        for c in _active
+                    )
+                    _src  = next(
+                        ("Screener {}/{}信號".format(r["sig_count"], r["enabled"])
+                         for r in st.session_state.get("sm_scan_results", [])
+                         if r["ticker"] == _tk),
+                        "手動加入"
+                    )
+                    _hs   = _bt.get("horizon_stats", {})
+                    _bhd  = max(_hs, key=lambda k: _hs[k]["平均漲幅"], default="") if _hs else ""
+                    _hold = "最優持倉 {}｜均漲{}%".format(_bhd, _hs[_bhd]["平均漲幅"]) if _bhd else ""
+
+                    st.markdown(
+                        "<div style='background:{bg};border:1px solid {bd};"
+                        "border-radius:8px;padding:12px;margin-top:4px'>"
+                        "<div style='display:flex;justify-content:space-between;"
+                        "align-items:center;margin-bottom:6px'>"
+                        "<span style='font-size:15px;font-weight:700'>{ic} {tk}</span>"
+                        "<span style='font-size:10px;color:#5a6580'>{ts}</span></div>"
+                        "<div style='font-size:10px;color:#7c5cfc;margin-bottom:6px'>{src}</div>"
+                        "<div style='display:grid;grid-template-columns:1fr 1fr;gap:4px;"
+                        "margin-bottom:8px;background:rgba(0,0,0,0.2);"
+                        "border-radius:4px;padding:7px'>"
+                        "<div style='font-size:11px;color:#5a6580'>現價</div>"
+                        "<div style='font-size:13px;font-weight:700'>${px:.2f}</div>"
+                        "<div style='font-size:11px;color:#5a6580'>漲幅</div>"
+                        "<div style='font-size:13px;font-weight:700;color:{rc}'>{ret:+.2f}%</div>"
+                        "<div style='font-size:11px;color:#5a6580'>量倍數</div>"
+                        "<div style='font-size:13px;font-weight:700;color:{vc}'>{vr:.2f}x</div>"
+                        "</div>"
+                        "<div style='margin-bottom:6px'>"
+                        "<div style='display:flex;justify-content:space-between;"
+                        "font-size:11px;margin-bottom:2px'>"
+                        "<span style='color:#5a6580'>爆升前特徵評分</span>"
+                        "<span style='color:{bc};font-weight:700'>{sc}/{ms} ({pct}%)</span></div>"
+                        "<div style='height:5px;background:#1e2535;border-radius:3px'>"
+                        "<div style='height:5px;width:{pct}%;background:{bc};"
+                        "border-radius:3px'></div></div></div>"
+                        "<div style='border-top:1px solid #1e2535;padding-top:6px'>{ch}</div>"
+                        "{hl}"
+                        "</div>".format(
+                            bg=_bg, bd=_bd, ic=_ic, tk=_tk,
+                            ts=_sig["time"].strftime("%H:%M:%S"),
+                            src=_src,
+                            px=_sig["price"],
+                            rc="#00d4aa" if _sig["ret"] > 0 else "#ff4560",
+                            ret=_sig["ret"] * 100,
+                            vc="#00d4aa" if _sig["vol_ratio"] >= 2 else "#ffd166" if _sig["vol_ratio"] >= 1.5 else "#e8edf5",
+                            vr=_sig["vol_ratio"],
+                            bc=_bc, sc=_score, ms=_maxs, pct=_pct,
+                            ch=_chtml,
+                            hl="<div style='margin-top:5px;font-size:10px;color:#5a6580'>{}</div>".format(_hold) if _hold else "",
+                        ),
+                        unsafe_allow_html=True
+                    )
+
 
 
 @st.fragment
