@@ -3495,7 +3495,7 @@ with tabs[-1]:
                     if v >= 1.2: return "background-color:#2a2200;color:#ffd166"
                     return "background-color:#2a0d0d;color:#ff4560"
                 except: return ""
-            styled = pwr_df.style.applymap(_color_lift, subset=["預測力倍數"])
+            styled = pwr_df.style.map(_color_lift, subset=["預測力倍數"])
             st.dataframe(styled, use_container_width=True, hide_index=True)
 
             # 預測力圖表
