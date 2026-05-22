@@ -3307,49 +3307,92 @@ def _realtime_check(ticker: str, bt_result: dict,
             pd.notna(up_vol) and pd.notna(dn_vol) and dn_vol < up_vol * 0.8
         )
 
-        # 用回測發現的個股高預測力特徵評分
+        # ── 計算當前數值 ──────────────────────────────────────────────────────
+        vr  = sig["vol_ratio"]
+        ret = sig["ret"]
+        cp  = float(last["close_pos"]) if pd.notna(last["close_pos"]) else 0.5
+        gap = float(last["gap"])       if pd.notna(last["gap"])       else 0
+        win_max_vr = float(window["vol_ratio"].max()) if pd.notna(window["vol_ratio"].max()) else 0
+
+        # ── 完整條件定義（附當前數值說明）────────────────────────────────────
+        # 格式：(條件是否成立, 分數, 當前數值說明)
+        feature_map = {
+            "📈 當日收陽線":          (ret > 0,          20, f"漲幅 {ret*100:+.2f}%"),
+            "📊 量≥1.5x (輕微放量)":  (vr >= 1.5,        10, f"量倍數 {vr:.2f}x"),
+            "📊 量≥2x (明顯放量)":    (vr >= 2.0,        20, f"量倍數 {vr:.2f}x"),
+            "📊 量≥3x (大量)":        (vr >= 3.0,        35, f"量倍數 {vr:.2f}x"),
+            "📊 量≥5x (爆量)":        (vr >= 5.0,        50, f"量倍數 {vr:.2f}x"),
+            "📍 收盤位置≥70%":        (cp >= 0.7,        10, f"收盤位置 {cp*100:.0f}%"),
+            "📍 收盤位置≥80%":        (cp >= 0.8,        15, f"收盤位置 {cp*100:.0f}%"),
+            "⬆️ 跳空高開≥1%":         (gap >= 0.01,      10, f"跳空 {gap*100:+.2f}%"),
+            "⬆️ 跳空高開≥2%":         (gap >= 0.02,      15, f"跳空 {gap*100:+.2f}%"),
+            "📈 D: 量能遞進放大":      (vol_escalating,   20, "近期量能後段>前段×1.1"),
+            "📈 E: 底部持續抬升":      (higher_lows,      20, "低點一次比一次高"),
+            "📉 F: 回落量快速萎縮":    (pullback_shrink,  20, "下跌日量<上漲日量×0.8"),
+            "🔍 窗口內曾出現量≥2x":   (win_max_vr >= 2.0, 10, f"窗口最大量 {win_max_vr:.2f}x"),
+            "🔍 窗口內曾出現量≥3x":   (win_max_vr >= 3.0, 15, f"窗口最大量 {win_max_vr:.2f}x"),
+        }
+
+        # ── 決定哪些條件參與評分 ─────────────────────────────────────────────
+        # 有回測結果：只用預測力>1.5倍的條件（個股化）
+        # 沒有回測結果：用全部條件（通用模式）
+        active_features = {f["特徵"] for f in top_features if f.get("預測力倍數", 0) >= 1.5}
+        use_all = len(active_features) == 0  # 沒有回測結果，啟用全部條件
+        bt_mode_label = "通用模式（請先執行回測以啟用個股化評分）" if use_all else f"個股模式（{len(active_features)} 個高預測力特徵）"
+
         score     = 0
         max_score = 0
         conds     = []
-        vr        = sig["vol_ratio"]
-        ret       = sig["ret"]
-        cp        = float(last["close_pos"]) if pd.notna(last["close_pos"]) else 0.5
-        gap       = float(last["gap"])       if pd.notna(last["gap"])       else 0
 
-        feature_map = {
-            "最後一天收陽線":        (ret > 0,             20),
-            "G: 最後一天量≥1.5x":   (vr >= 1.5,           10),
-            "G: 最後一天量≥2x":     (vr >= 2.0,           20),
-            "G: 最後一天量≥3x":     (vr >= 3.0,           35),
-            "G: 最後一天量≥5x":     (vr >= 5.0,           50),
-            "收盤位置≥70%":         (cp >= 0.7,           10),
-            "收盤位置≥80%":         (cp >= 0.8,           15),
-            "跳空高開≥1%":          (gap >= 0.01,         10),
-            "跳空高開≥2%":          (gap >= 0.02,         15),
-            "D: 量能遞進放大":       (vol_escalating,      20),
-            "D: 量能斜率向上":       (vol_escalating,      15),
-            "E: 底部持續抬升":       (higher_lows,         20),
-            "F: 回落量快速萎縮":     (pullback_shrink,     20),
-            "窗口內曾出現量≥2x":    (window["vol_ratio"].max() >= 2.0, 10),
-            "窗口內曾出現量≥3x":    (window["vol_ratio"].max() >= 3.0, 15),
-        }
-
-        # 只用回測中預測力>1.5倍的特徵打分
-        active_features = {f["特徵"] for f in top_features if f.get("預測力倍數", 0) >= 1.5}
-
-        for feat_name, (condition, pts) in feature_map.items():
-            if feat_name not in active_features:
+        for feat_name, (condition, pts, current_val) in feature_map.items():
+            # 判斷此條件是否參與評分
+            # 個股模式：特徵名稱需在 active_features 中（做模糊匹配）
+            feat_key = feat_name.split(": ")[-1].split(" (")[0].strip()
+            in_active = use_all or any(
+                feat_key in af or af in feat_name
+                for af in active_features
+            )
+            if not in_active:
+                # 不參與評分，但仍顯示當前狀態（灰色）
+                status = "✅" if condition else "⬜"
+                conds.append({
+                    "text":    f"{status} {feat_name}",
+                    "value":   current_val,
+                    "active":  False,
+                    "passed":  condition,
+                    "pts":     0,
+                })
                 continue
+
             max_score += pts
             if condition:
                 score += pts
-                conds.append(f"✅ {feat_name} (+{pts}分)")
+                conds.append({
+                    "text":   f"✅ {feat_name}",
+                    "value":  current_val,
+                    "active": True,
+                    "passed": True,
+                    "pts":    pts,
+                })
             else:
-                conds.append(f"❌ {feat_name}")
+                conds.append({
+                    "text":   f"❌ {feat_name}",
+                    "value":  current_val,
+                    "active": True,
+                    "passed": False,
+                    "pts":    pts,
+                })
 
-        sig["score"]      = score
-        sig["max_score"]  = max_score if max_score > 0 else 100
-        sig["conditions"] = conds
+        sig["score"]        = score
+        sig["max_score"]    = max_score if max_score > 0 else 100
+        sig["conditions"]   = conds
+        sig["bt_mode"]      = bt_mode_label
+        sig["vol_escalating"]   = vol_escalating
+        sig["higher_lows"]      = higher_lows
+        sig["pullback_shrink"]  = pullback_shrink
+        sig["close_pos"]        = cp
+        sig["gap"]              = gap
+
         # 觸發：分數達到 max_score 的 65% 且有量能遞進或底部抬升
         process_ok = vol_escalating or higher_lows
         sig["triggered"] = (
@@ -3731,56 +3774,101 @@ with tabs[-1]:
             if sig.get("error"):
                 st.warning(f"⚠️ {sig['error']}")
             else:
-                score    = sig["score"]
-                max_sc   = sig["max_score"]
-                pct      = int(score / max(max_sc, 1) * 100)
-                trig     = sig["triggered"]
-                box_cls  = ("sp-green" if trig
-                            else "sp-yellow" if pct >= 50
-                            else "sp-grey")
-                bar_col  = ("#00d4aa" if trig
-                            else "#ffd166" if pct >= 50
-                            else "#5a6580")
+                score  = sig["score"]
+                max_sc = sig["max_score"]
+                pct    = int(score / max(max_sc, 1) * 100)
+                trig   = sig["triggered"]
+                bar_col = "#00d4aa" if trig else "#ffd166" if pct >= 50 else "#5a6580"
+                bdr_col = "#00d4aa" if trig else "#ffd166" if pct >= 50 else "#1e2535"
+                bg_col  = "rgba(0,212,170,0.08)" if trig else "rgba(255,209,102,0.05)" if pct >= 50 else "rgba(22,27,39,0.8)"
+                status_icon = "🚨" if trig else "🟡" if pct >= 50 else "⚪"
+                status_text = "信號觸發！" if trig else "接近觸發" if pct >= 50 else "監控中"
 
+                # ── 頂部狀態面板 ─────────────────────────────────────────────
                 st.markdown(f"""
-                <div style="background:{'rgba(0,212,170,0.1)' if trig else 'rgba(30,37,53,0.6)'};
-                            border:1px solid {'#00d4aa' if trig else '#1e2535'};
-                            border-radius:8px;padding:16px;margin:8px 0">
-                  <div style="display:flex;justify-content:space-between;margin-bottom:10px">
-                    <span style="font-size:16px;font-weight:700">
-                      {'🚨 信號觸發！' if trig else '⚪ 監控中'}
-                      &nbsp;{mon_ticker}
-                    </span>
-                    <span style="color:#5a6580;font-size:12px">
-                      {sig['time'].strftime('%H:%M:%S')}
-                    </span>
-                  </div>
-                  <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:12px">
-                    <div>現價<br><b>${sig['price']:.2f}</b></div>
-                    <div>漲幅<br><b style="color:{'#00d4aa' if sig['ret']>0 else '#ff4560'}">{sig['ret']*100:+.2f}%</b></div>
-                    <div>量倍數<br><b>{sig['vol_ratio']:.1f}x</b></div>
-                  </div>
-                  <div style="margin-bottom:6px;font-size:12px">
-                    個股特徵評分 <b>{score}/{max_sc}</b>（{pct}%）
-                    <div style="height:6px;background:#1e2535;border-radius:3px;margin-top:4px">
-                      <div style="height:6px;width:{pct}%;background:{bar_col};border-radius:3px"></div>
-                    </div>
-                  </div>
-                  <div style="font-size:12px;color:#8892a4">
-                    {'<br>'.join(sig.get('conditions',[]))}
-                  </div>
-                </div>
-                """, unsafe_allow_html=True)
+<div style="background:{bg_col};border:1px solid {bdr_col};
+            border-radius:10px;padding:16px 20px;margin:8px 0">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+    <span style="font-size:18px;font-weight:700">{status_icon} {status_text} — {mon_ticker}</span>
+    <span style="color:#5a6580;font-size:12px;font-family:monospace">{sig['time'].strftime('%Y-%m-%d %H:%M:%S')}</span>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;
+              background:rgba(0,0,0,0.2);border-radius:6px;padding:12px;margin-bottom:14px">
+    <div style="text-align:center">
+      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">現價</div>
+      <div style="font-size:16px;font-weight:700">${sig['price']:.2f}</div>
+    </div>
+    <div style="text-align:center">
+      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">漲幅</div>
+      <div style="font-size:16px;font-weight:700;color:{'#00d4aa' if sig['ret']>0 else '#ff4560'}">{sig['ret']*100:+.2f}%</div>
+    </div>
+    <div style="text-align:center">
+      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">量倍數 (20日均)</div>
+      <div style="font-size:16px;font-weight:700;color:{'#00d4aa' if sig['vol_ratio']>=2 else '#ffd166' if sig['vol_ratio']>=1.5 else '#e8edf5'}">{sig['vol_ratio']:.2f}x</div>
+    </div>
+    <div style="text-align:center">
+      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">收盤位置</div>
+      <div style="font-size:16px;font-weight:700">{sig.get('close_pos',0)*100:.0f}%</div>
+    </div>
+    <div style="text-align:center">
+      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">跳空</div>
+      <div style="font-size:16px;font-weight:700;color:{'#00d4aa' if sig.get('gap',0)>0.01 else '#e8edf5'}">{sig.get('gap',0)*100:+.2f}%</div>
+    </div>
+  </div>
+  <div>
+    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
+      <span style="color:#5a6580">{sig.get('bt_mode','')}</span>
+      <span><b style="color:{bar_col}">{score}</b> / {max_sc} 分 ({pct}%)</span>
+    </div>
+    <div style="height:8px;background:#1e2535;border-radius:4px">
+      <div style="height:8px;width:{pct}%;background:{bar_col};border-radius:4px"></div>
+    </div>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
+                # ── 條件明細 ─────────────────────────────────────────────────
+                conds = sig.get("conditions", [])
+                active_conds   = [c for c in conds if isinstance(c, dict) and c.get("active")]
+                inactive_conds = [c for c in conds if isinstance(c, dict) and not c.get("active")]
+
+                if active_conds:
+                    st.markdown("**📋 評分條件明細**")
+                    col_a, col_b = st.columns(2)
+                    for i, c in enumerate(active_conds):
+                        col = col_a if i % 2 == 0 else col_b
+                        passed_color = "#00d4aa" if c["passed"] else "#ff4560"
+                        pts_str = f"+{c['pts']}分" if c["passed"] else f"未達標 (0/{c['pts']}分)"
+                        col.markdown(
+                            f"<div style='background:rgba(0,0,0,0.25);border-left:3px solid {passed_color};"
+                            f"border-radius:4px;padding:8px 10px;margin:3px 0;font-size:12px'>"
+                            f"<div style='font-weight:600;margin-bottom:3px'>{c['text']}</div>"
+                            f"<div style='display:flex;justify-content:space-between;color:#8892a4'>"
+                            f"<span>📌 {c['value']}</span>"
+                            f"<span style='color:{passed_color};font-weight:600'>{pts_str}</span>"
+                            f"</div></div>",
+                            unsafe_allow_html=True
+                        )
+
+                if inactive_conds:
+                    with st.expander(f"⬜ 預測力不足，未參與評分（{len(inactive_conds)} 個）"):
+                        for c in inactive_conds:
+                            st.caption(f"{c['text']}　📌 {c['value']}")
+
+                # 觸發 / 接近觸發 提示
                 if trig:
-                    best_hd_rt = ""
                     hs = bt_res.get("horizon_stats", {})
+                    best_hd_rt = ""
                     if hs:
                         best_hd = max(hs, key=lambda k: hs[k]["平均漲幅"])
                         best_hd_rt = (f"最優持倉 {best_hd}，"
                                       f"歷史均漲 {hs[best_hd]['平均漲幅']}%，"
                                       f"勝率 {hs[best_hd]['勝率']}%")
                     st.success(f"📱 已/將發送 Telegram｜{best_hd_rt}")
+                elif pct >= 50:
+                    missing = [c["text"].replace("❌ ","") for c in active_conds if not c.get("passed")]
+                    if missing:
+                        st.info(f"🔜 距觸發還差：{' · '.join(missing[:3])}")
 
         # ══════════════════════════════════════════════════════════════════════
         #  🤖 AI 分析對話區（Groq llama-3.3-70b）
