@@ -3464,576 +3464,504 @@ def _build_surge_tg_msg(sig: dict, bt: dict) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 with tabs[-1]:
     st.markdown("## 🔬 爆升前特徵分析")
-    st.caption("回測找出個股爆升前獨有特徵 → 實時監控 → Telegram推送")
+    st.caption("多股同時回測 → 找出個股爆升前獨有特徵 → 實時監控 → Telegram推送")
 
-    # ── 參數設定 ─────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  共用參數（所有股票共用同一套回測設定）
+    # ══════════════════════════════════════════════════════════════════════════
     with st.expander("⚙️ 回測參數設定", expanded=True):
         c1, c2, c3 = st.columns(3)
         with c1:
-            sp_ticker  = st.text_input("股票代號", value="TSLA",
-                                        key="sp_ticker").upper().strip()
-            sp_period  = st.selectbox("回測年數",
+            sp_tickers_raw = st.text_input(
+                "股票代號（逗號分隔，最多10隻）",
+                value="TSLA, NVDA, AAPL",
+                key="sp_tickers_raw"
+            )
+            sp_period = st.selectbox(
+                "回測年數",
                 ["1y","2y","3y","5y","10y","max"],
                 index=3, key="sp_period",
                 format_func=lambda x: {"1y":"1年","2y":"2年","3y":"3年",
-                                        "5y":"5年","10y":"10年","max":"最大"}[x])
+                                       "5y":"5年","10y":"10年","max":"最大"}[x]
+            )
         with c2:
-            sp_surge   = st.slider("爆升定義：N天漲幅 (%)",
-                                    5, 30, 10, 1, key="sp_surge")
-            sp_days    = st.slider("爆升定義：往後看幾天",
-                                    3, 20, 7, 1, key="sp_days")
+            sp_surge  = st.slider("爆升定義：N天漲幅 (%)", 5, 30, 10, 1, key="sp_surge")
+            sp_days   = st.slider("爆升定義：往後看幾天",  3, 20,  7, 1, key="sp_days")
         with c3:
-            sp_lb      = st.slider("往前看幾天找特徵",
-                                    3, 20, 7, 1, key="sp_lb")
-            sp_train   = st.slider("訓練集比例",
-                                    0.5, 0.9, 0.7, 0.05, key="sp_train",
-                                    format="%.0f%%",
-                                    help="前X%數據找規律，後面驗證")
-            sp_vol_win = st.slider("成交量均線窗口",
-                                    5, 30, 20, 1, key="sp_vol_win")
+            sp_lb     = st.slider("往前看幾天找特徵",      3, 20,  7, 1, key="sp_lb")
+            sp_train  = st.slider("訓練集比例", 0.5, 0.9, 0.7, 0.05, key="sp_train",
+                                  format="%.0f%%", help="前X%數據找規律，後面驗證")
+            sp_vol_win = st.slider("成交量均線窗口", 5, 30, 20, 1, key="sp_vol_win")
 
-    run_col, _ = st.columns([1, 3])
-    with run_col:
-        run_sp = st.button("▶ 開始分析", type="primary",
-                           use_container_width=True, key="run_sp_btn")
+    # 解析股票清單（去重、大寫、最多10隻）
+    sp_ticker_list = list(dict.fromkeys(
+        t.strip().upper()
+        for t in sp_tickers_raw.split(",")
+        if t.strip()
+    ))[:10]
 
-    if run_sp and sp_ticker:
-        with st.spinner(f"正在分析 {sp_ticker}，約需 20-40 秒..."):
-            bt_res = _surge_backtest(
-                sp_ticker, sp_period, sp_surge, sp_days,
+    # ══════════════════════════════════════════════════════════════════════════
+    #  回測操作列
+    # ══════════════════════════════════════════════════════════════════════════
+    run_c1, run_c2, run_c3 = st.columns([2, 2, 4])
+    with run_c1:
+        run_all = st.button("▶ 全部回測", type="primary",
+                            use_container_width=True, key="run_all_btn")
+    with run_c2:
+        clear_all = st.button("🗑️ 清除結果", use_container_width=True, key="clear_all_btn")
+    with run_c3:
+        already_done = [t for t in sp_ticker_list
+                        if st.session_state.get(f"sp_result_{t}") and
+                        not st.session_state[f"sp_result_{t}"].get("error")]
+        st.caption(f"✅ 已回測：{', '.join(already_done) if already_done else '無'}"
+                   f" | 待回測：{', '.join([t for t in sp_ticker_list if t not in already_done])}")
+
+    if clear_all:
+        for t in sp_ticker_list:
+            st.session_state.pop(f"sp_result_{t}", None)
+            st.session_state.pop(f"sp_sig_{t}", None)
+        st.rerun()
+
+    # 全部回測
+    if run_all and sp_ticker_list:
+        prog_bar = st.progress(0, text="準備中...")
+        for i, ticker in enumerate(sp_ticker_list):
+            prog_bar.progress(
+                (i) / len(sp_ticker_list),
+                text=f"正在分析 {ticker}（{i+1}/{len(sp_ticker_list)}）..."
+            )
+            bt = _surge_backtest(
+                ticker, sp_period, sp_surge, sp_days,
                 sp_lb, sp_train, sp_vol_win
             )
-            st.session_state[f"sp_result_{sp_ticker}"] = bt_res
+            st.session_state[f"sp_result_{ticker}"] = bt
+        prog_bar.progress(1.0, text="✅ 全部回測完成！")
 
-    # ── 顯示結果 ─────────────────────────────────────────────────────────────
-    bt_res = st.session_state.get(f"sp_result_{sp_ticker}")
+    # ══════════════════════════════════════════════════════════════════════════
+    #  跨股比較總表（只顯示已回測的股票）
+    # ══════════════════════════════════════════════════════════════════════════
+    done_tickers = [t for t in sp_ticker_list
+                    if st.session_state.get(f"sp_result_{t}") and
+                    not st.session_state[f"sp_result_{t}"].get("error")]
 
-    if bt_res:
-        if bt_res.get("error"):
-            st.error(f"❌ {bt_res['error']}")
-            st.stop()
-
-        surge_pts = bt_res.get("surge_points", [])
-        pwr_data  = bt_res.get("feature_power", [])
-        pwr_df    = pd.DataFrame(pwr_data) if pwr_data else pd.DataFrame()
-
-        # ── 總覽指標 ─────────────────────────────────────────────────────────
+    if done_tickers:
         st.divider()
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("總K線數",    bt_res["total_bars"])
-        m2.metric("爆升點數",   len(surge_pts),
-                  f"定義: {sp_days}天漲>{sp_surge}%")
-        m3.metric("特徵分析數", len(pwr_df) if not pwr_df.empty else 0)
-        tr = bt_res.get("train_result", {})
-        te = bt_res.get("test_result",  {})
-        m4.metric("訓練集樣本", tr.get("樣本數", 0),
-                  f"前{int(sp_train*100)}%數據")
-        m5.metric("測試集樣本", te.get("樣本數", 0),
-                  f"後{int((1-sp_train)*100)}%數據")
+        st.markdown("### 📊 多股回測比較總表")
 
-        # ── A+H: 特徵預測力排行 ──────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 🏆 個股特徵預測力排行（A+H）")
-        st.caption("預測力倍數 = 爆升前出現率 / 非爆升期出現率。>2倍 = 強信號，<1.2倍 = 無意義")
+        summary_rows = []
+        for t in done_tickers:
+            bt = st.session_state[f"sp_result_{t}"]
+            pwr = bt.get("feature_power", [])
+            top1 = pwr[0]["特徵"] if pwr else "N/A"
+            top1_lift = pwr[0]["預測力倍數"] if pwr else 0
+            hs   = bt.get("horizon_stats", {})
+            best_hd = max(hs, key=lambda k: hs[k]["平均漲幅"], default="N/A") if hs else "N/A"
+            best_wr = hs.get(best_hd, {}).get("勝率", "N/A") if hs else "N/A"
+            best_rt = hs.get(best_hd, {}).get("平均漲幅", "N/A") if hs else "N/A"
+            rs   = bt.get("regime_stats", {})
+            bull_rate = rs.get("牛市", {}).get("爆升率", "N/A")
+            bear_rate = rs.get("熊市", {}).get("爆升率", "N/A")
+            ei   = bt.get("earnings_impact", {})
+            tr   = bt.get("train_result", {})
+            te   = bt.get("test_result",  {})
+            summary_rows.append({
+                "股票":       t,
+                "爆升點數":   len(bt.get("surge_points", [])),
+                "最強特徵":   f"{top1}({top1_lift:.1f}x)",
+                "最優持倉":   best_hd,
+                "最優勝率":   f"{best_wr}%",
+                "最優均漲":   f"+{best_rt}%",
+                "牛市爆升率": f"{bull_rate}%",
+                "熊市爆升率": f"{bear_rate}%",
+                "財報週佔比": f"{ei.get('財報週佔比','N/A')}%",
+                "訓練樣本":   tr.get("樣本數", 0),
+                "測試樣本":   te.get("樣本數", 0),
+            })
 
-        if not pwr_df.empty:
-            def _color_lift(val):
-                try:
-                    v = float(val)
-                    if v >= 2.5: return "background-color:#0d3b1e;color:#00d4aa"
-                    if v >= 1.5: return "background-color:#1a2e0d;color:#7ec850"
-                    if v >= 1.2: return "background-color:#2a2200;color:#ffd166"
-                    return "background-color:#2a0d0d;color:#ff4560"
-                except: return ""
-            styled = pwr_df.style.map(_color_lift, subset=["預測力倍數"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
 
-            # 預測力圖表
-            fig_pwr = go.Figure(go.Bar(
-                x=pwr_df["預測力倍數"],
-                y=pwr_df["特徵"],
-                orientation="h",
-                marker_color=[
-                    "#00d4aa" if v >= 2.0 else "#ffd166" if v >= 1.5 else "#ff4560"
-                    for v in pwr_df["預測力倍數"]
-                ],
-                text=[f"{v:.1f}x" for v in pwr_df["預測力倍數"]],
-                textposition="outside",
-            ))
-            fig_pwr.add_vline(x=1.0, line_dash="dash", line_color="gray",
-                              annotation_text="基準線(1x)")
-            fig_pwr.add_vline(x=2.0, line_dash="dash", line_color="#00d4aa",
-                              annotation_text="強信號(2x)")
-            fig_pwr.update_layout(
-                title=f"{sp_ticker} 各特徵預測力",
-                xaxis_title="預測力倍數",
-                template="plotly_dark", height=400,
-                margin=dict(l=200, r=60, t=40, b=40),
-            )
-            st.plotly_chart(fig_pwr, use_container_width=True,
-                            key="fig_pwr_chart")
-        else:
-            st.info("無特徵數據")
-
-        # ── D+E+F: 過程特徵統計 ──────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 📈 爆升前過程特徵統計（D+E+F）")
-        st.caption("比較爆升前N天 vs 非爆升期的過程特徵出現率")
-
-        ps = bt_res.get("process_stats", {})
-        if ps:
-            ps_rows = []
-            for name, vals in ps.items():
-                ps_rows.append({
-                    "過程特徵":    name,
-                    "爆升前出現率": vals.get("爆升前出現率", "N/A"),
-                    "非爆升出現率": vals.get("非爆升出現率", "N/A"),
-                })
-            st.dataframe(pd.DataFrame(ps_rows), use_container_width=True,
-                         hide_index=True)
-        else:
-            st.info("無過程特徵數據")
-
-        # ── G: 成交量分層統計 ─────────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 📊 成交量分層爆升率（G）")
-        st.caption("不同量能等級下的爆升率，量越大是否勝率越高？")
-
-        ls = bt_res.get("layer_stats", {})
-        if ls:
-            ls_rows = [
-                {"量能等級": k, **v}
-                for k, v in ls.items()
-            ]
-            ls_df = pd.DataFrame(ls_rows)
-            col_l, col_r = st.columns(2)
-            with col_l:
-                st.dataframe(ls_df, use_container_width=True, hide_index=True)
-            with col_r:
-                fig_ls = go.Figure(go.Bar(
-                    x=[r["量能等級"] for r in ls_rows],
-                    y=[r["爆升率"] for r in ls_rows],
-                    marker_color="#00d4aa",
-                    text=[f"{r['爆升率']}%" for r in ls_rows],
-                    textposition="outside",
-                ))
-                fig_ls.update_layout(
-                    title="各量能層級爆升率(%)",
-                    template="plotly_dark", height=280,
-                    margin=dict(t=40, b=20),
-                )
-                st.plotly_chart(fig_ls, use_container_width=True,
-                                key="fig_ls_chart")
-
-        # ── I: 最優持倉天數 ───────────────────────────────────────────────────
-        st.divider()
-        st.markdown(f"### ⏱️ {sp_ticker} 最優持倉天數（I）")
-        st.caption("爆升點後持倉1/3/5/10天的歷史平均表現")
-
-        hs = bt_res.get("horizon_stats", {})
-        if hs:
-            hs_rows = [{"持倉天數": k, **v} for k, v in hs.items()]
-            hs_df   = pd.DataFrame(hs_rows)
-            best_hd = max(hs, key=lambda k: hs[k]["平均漲幅"])
-
-            col_h1, col_h2 = st.columns(2)
-            with col_h1:
-                st.dataframe(hs_df, use_container_width=True, hide_index=True)
-                st.success(f"🏆 最優持倉：**{best_hd}**"
-                           f"（均漲 {hs[best_hd]['平均漲幅']}%，"
-                           f"勝率 {hs[best_hd]['勝率']}%）")
-            with col_h2:
-                fig_hs = go.Figure()
-                fig_hs.add_trace(go.Bar(
-                    name="平均漲幅",
-                    x=list(hs.keys()),
-                    y=[v["平均漲幅"] for v in hs.values()],
-                    marker_color="#7c5cfc",
-                    text=[f"{v['平均漲幅']}%" for v in hs.values()],
-                    textposition="outside",
-                ))
-                fig_hs.update_layout(
-                    template="plotly_dark", height=280,
-                    margin=dict(t=20, b=20),
-                )
-                st.plotly_chart(fig_hs, use_container_width=True,
-                                key="fig_hs_chart")
-
-        # ── J: 大市環境分層 ───────────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 🌍 大市環境分層統計（J）")
-        st.caption("牛市/熊市/震盪市下，爆升信號的勝率是否不同？")
-
-        rs = bt_res.get("regime_stats", {})
-        if rs:
-            rs_rows = [{"環境": k, **v} for k, v in rs.items()]
-            rs_df   = pd.DataFrame(rs_rows)
-            col_j1, col_j2 = st.columns(2)
-            with col_j1:
-                st.dataframe(rs_df, use_container_width=True, hide_index=True)
-            with col_j2:
-                fig_rs = go.Figure(go.Bar(
-                    x=[r["環境"] for r in rs_rows],
-                    y=[r["爆升率"] for r in rs_rows],
-                    marker_color=["#00d4aa","#ff4560","#ffd166"],
-                    text=[f"{r['爆升率']}%" for r in rs_rows],
-                    textposition="outside",
-                ))
-                fig_rs.update_layout(
-                    title="不同大市環境下的爆升率",
-                    template="plotly_dark", height=280,
-                    margin=dict(t=40, b=20),
-                )
-                st.plotly_chart(fig_rs, use_container_width=True,
-                                key="fig_rs_chart")
-
-        # ── L: 財報週影響 ─────────────────────────────────────────────────────
-        st.divider()
-        st.markdown("### 📅 財報週影響分析（L）")
-
-        ei = bt_res.get("earnings_impact", {})
-        edates = bt_res.get("earnings_dates", [])
-        col_l1, col_l2 = st.columns(2)
-        with col_l1:
-            if ei:
-                st.metric("財報週爆升次數",   ei.get("財報週爆升次數", 0))
-                st.metric("非財報週爆升次數", ei.get("非財報週爆升次數", 0))
-                st.metric("財報週佔比",       f"{ei.get('財報週佔比', 0)}%")
-                if ei.get("財報週佔比", 0) > 30:
-                    st.warning("⚠️ 超過30%的爆升發生在財報週，"
-                               "成交量信號需額外謹慎（財報週量能意義不同）")
-                else:
-                    st.success("✅ 財報週影響有限，量能信號相對可靠")
-            else:
-                st.info("無財報數據")
-        with col_l2:
-            if edates:
-                st.caption("近期財報日：")
-                for d in sorted(edates)[-6:]:
-                    st.caption(f"  📅 {d}")
-
-        # ── C: 訓練集 vs 測試集對比 ───────────────────────────────────────────
-        st.divider()
-        st.markdown("### 🔬 訓練集 vs 測試集驗證（C）")
-        st.caption("如果兩個集合的特徵分布差異很大，說明規律可能是歷史特定時期的幻象")
-
-        tr = bt_res.get("train_result", {})
-        te = bt_res.get("test_result",  {})
-        if tr and te:
-            comp_df = pd.DataFrame([tr, te])
-            st.dataframe(comp_df, use_container_width=True, hide_index=True)
-
-            # 判斷訓練/測試是否一致
-            tr_n = tr.get("樣本數", 0)
-            te_n = te.get("樣本數", 0)
-            if te_n == 0:
-                st.warning("⚠️ 測試集樣本不足，無法驗證")
-            elif abs(tr_n - te_n * (sp_train / (1 - sp_train))) / max(tr_n, 1) > 0.4:
-                st.warning("⚠️ 訓練集與測試集樣本比例差異較大，"
-                           "可能受特定市場環境影響（結合大市環境分層查看）")
-            else:
-                st.success("✅ 訓練集與測試集樣本分布基本均衡，規律相對可靠")
-
-        # ── 實時監控區 ────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  實時監控面板（多股並行）
+    # ══════════════════════════════════════════════════════════════════════════
+    if done_tickers:
         st.divider()
         st.markdown("### 📡 實時監控")
-        st.caption("基於上方回測找出的個股特徵，即時掃描當前狀態")
+        st.caption("基於各股個性化回測特徵，同時掃描所有股票")
 
-        mon_col1, mon_col2 = st.columns([2, 1])
-        with mon_col1:
-            mon_ticker = st.text_input(
-                "監控股票（可與回測不同）",
-                value=sp_ticker, key="sp_mon_ticker"
-            ).upper().strip()
-        with mon_col2:
-            st.markdown("<br>", unsafe_allow_html=True)
-            do_scan = st.button("🔍 立即掃描", key="sp_scan_btn",
-                                use_container_width=True)
+        mon_c1, mon_c2, mon_c3 = st.columns([2, 2, 4])
+        with mon_c1:
+            scan_all_btn = st.button("🔍 全部掃描", type="primary",
+                                     use_container_width=True, key="scan_all_btn")
+        with mon_c2:
+            auto_tg = st.checkbox("觸發時自動發 Telegram", value=True, key="auto_tg")
+        with mon_c3:
+            triggered_now = [t for t in done_tickers
+                             if st.session_state.get(f"sp_sig_{t}", {}).get("triggered")]
+            if triggered_now:
+                st.error(f"🚨 已觸發：{', '.join(triggered_now)}")
+            else:
+                st.caption("目前無觸發信號")
 
-        if do_scan and bt_res and not bt_res.get("error"):
-            with st.spinner(f"掃描 {mon_ticker}..."):
-                sig = _realtime_check(
-                    mon_ticker, bt_res, pwr_data, sp_vol_win
-                )
-                st.session_state[f"sp_sig_{mon_ticker}"] = sig
+        # 全部掃描
+        if scan_all_btn:
+            prog2 = st.progress(0, text="掃描中...")
+            for i, ticker in enumerate(done_tickers):
+                prog2.progress(i / len(done_tickers),
+                               text=f"掃描 {ticker}（{i+1}/{len(done_tickers)}）...")
+                bt = st.session_state[f"sp_result_{ticker}"]
+                pwr_data = bt.get("feature_power", [])
+                sig = _realtime_check(ticker, bt, pwr_data, sp_vol_win)
+                st.session_state[f"sp_sig_{ticker}"] = sig
 
-                # 觸發 → 發 Telegram
-                if sig.get("triggered") and not sig.get("error"):
-                    sig_key = f"sp_{mon_ticker}_{sig['time'].strftime('%Y%m%d%H%M')}"
+                if auto_tg and sig.get("triggered") and not sig.get("error"):
+                    sig_key = f"sp_{ticker}_{sig['time'].strftime('%Y%m%d%H%M')}"
                     if sig_key not in st.session_state.get("sent_signals", set()):
-                        msg = _build_surge_tg_msg(sig, bt_res)
-                        ok, err = send_telegram_alert(msg, mon_ticker)
+                        msg = _build_surge_tg_msg(sig, bt)
+                        ok, err = send_telegram_alert(msg, ticker)
                         if ok:
                             st.session_state.setdefault("sent_signals", set()).add(sig_key)
-                            st.toast(f"📱 Telegram 已發送 ({mon_ticker})")
-                        else:
-                            st.warning(f"Telegram 發送失敗: {err}")
+                            st.toast(f"📱 {ticker} Telegram 已發送")
+            prog2.progress(1.0, text="✅ 掃描完成")
 
-        sig = st.session_state.get(f"sp_sig_{mon_ticker}")
-        if sig:
-            if sig.get("error"):
-                st.warning(f"⚠️ {sig['error']}")
-            else:
-                score  = sig["score"]
-                max_sc = sig["max_score"]
-                pct    = int(score / max(max_sc, 1) * 100)
-                trig   = sig["triggered"]
-                bar_col = "#00d4aa" if trig else "#ffd166" if pct >= 50 else "#5a6580"
-                bdr_col = "#00d4aa" if trig else "#ffd166" if pct >= 50 else "#1e2535"
-                bg_col  = "rgba(0,212,170,0.08)" if trig else "rgba(255,209,102,0.05)" if pct >= 50 else "rgba(22,27,39,0.8)"
-                status_icon = "🚨" if trig else "🟡" if pct >= 50 else "⚪"
-                status_text = "信號觸發！" if trig else "接近觸發" if pct >= 50 else "監控中"
+        # ── 各股信號卡片 ──────────────────────────────────────────────────────
+        # 每行3個
+        for row_start in range(0, len(done_tickers), 3):
+            row_tickers = done_tickers[row_start:row_start+3]
+            cols = st.columns(len(row_tickers))
+            for col, ticker in zip(cols, row_tickers):
+                with col:
+                    bt  = st.session_state[f"sp_result_{ticker}"]
+                    sig = st.session_state.get(f"sp_sig_{ticker}")
 
-                # ── 頂部狀態面板 ─────────────────────────────────────────────
-                st.markdown(f"""
+                    # 個別掃描按鈕
+                    if st.button(f"🔍 {ticker}", key=f"scan_single_{ticker}",
+                                 use_container_width=True):
+                        pwr_data = bt.get("feature_power", [])
+                        sig = _realtime_check(ticker, bt, pwr_data, sp_vol_win)
+                        st.session_state[f"sp_sig_{ticker}"] = sig
+                        if auto_tg and sig.get("triggered") and not sig.get("error"):
+                            sig_key = f"sp_{ticker}_{sig['time'].strftime('%Y%m%d%H%M')}"
+                            if sig_key not in st.session_state.get("sent_signals", set()):
+                                msg = _build_surge_tg_msg(sig, bt)
+                                ok, _ = send_telegram_alert(msg, ticker)
+                                if ok:
+                                    st.session_state.setdefault("sent_signals", set()).add(sig_key)
+                                    st.toast(f"📱 {ticker} Telegram 已發送")
+
+                    if sig is None:
+                        st.markdown(
+                            f"<div style='background:#161b27;border:1px solid #1e2535;"
+                            f"border-radius:8px;padding:14px;text-align:center;color:#5a6580'>"
+                            f"⚪ 尚未掃描</div>",
+                            unsafe_allow_html=True
+                        )
+                        continue
+
+                    if sig.get("error"):
+                        st.warning(f"⚠️ {sig['error']}")
+                        continue
+
+                    score  = sig["score"]
+                    max_sc = sig["max_score"]
+                    pct    = int(score / max(max_sc, 1) * 100)
+                    trig   = sig["triggered"]
+                    bar_col = "#00d4aa" if trig else "#ffd166" if pct >= 50 else "#5a6580"
+                    bdr_col = "#00d4aa" if trig else "#ffd166" if pct >= 50 else "#2a3040"
+                    bg_col  = "rgba(0,212,170,0.1)" if trig else "rgba(255,209,102,0.06)" if pct >= 50 else "#161b27"
+                    icon    = "🚨" if trig else "🟡" if pct >= 50 else "⚪"
+
+                    # 條件明細文字
+                    conds = sig.get("conditions", [])
+                    active = [c for c in conds if isinstance(c, dict) and c.get("active")]
+                    cond_html = "".join(
+                        f"<div style='font-size:11px;padding:2px 0;"
+                        f"color:{'#00d4aa' if c['passed'] else '#ff4560'}'>"
+                        f"{'✅' if c['passed'] else '❌'} {c['text'].replace('✅ ','').replace('❌ ','')} "
+                        f"<span style='color:#5a6580'>({c['value']})</span>"
+                        f"{'<span style=\"color:#00d4aa\"> +'+str(c['pts'])+'分</span>' if c['passed'] else ''}"
+                        f"</div>"
+                        for c in active
+                    )
+
+                    # 最優持倉
+                    hs = bt.get("horizon_stats", {})
+                    best_hd = max(hs, key=lambda k: hs[k]["平均漲幅"], default="") if hs else ""
+                    hold_str = f"最優持倉 {best_hd}｜均漲{hs[best_hd]['平均漲幅']}%" if best_hd else ""
+
+                    st.markdown(f"""
 <div style="background:{bg_col};border:1px solid {bdr_col};
-            border-radius:10px;padding:16px 20px;margin:8px 0">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
-    <span style="font-size:18px;font-weight:700">{status_icon} {status_text} — {mon_ticker}</span>
-    <span style="color:#5a6580;font-size:12px;font-family:monospace">{sig['time'].strftime('%Y-%m-%d %H:%M:%S')}</span>
+            border-radius:8px;padding:12px;margin-top:4px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <span style="font-size:15px;font-weight:700">{icon} {ticker}</span>
+    <span style="font-size:10px;color:#5a6580">{sig['time'].strftime('%H:%M:%S')}</span>
   </div>
-  <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;
-              background:rgba(0,0,0,0.2);border-radius:6px;padding:12px;margin-bottom:14px">
-    <div style="text-align:center">
-      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">現價</div>
-      <div style="font-size:16px;font-weight:700">${sig['price']:.2f}</div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px;
+              background:rgba(0,0,0,0.2);border-radius:4px;padding:8px">
+    <div style="font-size:11px;color:#5a6580">現價</div>
+    <div style="font-size:14px;font-weight:700">${sig['price']:.2f}</div>
+    <div style="font-size:11px;color:#5a6580">漲幅</div>
+    <div style="font-size:14px;font-weight:700;color:{'#00d4aa' if sig['ret']>0 else '#ff4560'}">{sig['ret']*100:+.2f}%</div>
+    <div style="font-size:11px;color:#5a6580">量倍數</div>
+    <div style="font-size:14px;font-weight:700;color:{'#00d4aa' if sig['vol_ratio']>=2 else '#ffd166' if sig['vol_ratio']>=1.5 else '#e8edf5'}">{sig['vol_ratio']:.2f}x</div>
+    <div style="font-size:11px;color:#5a6580">收盤位置</div>
+    <div style="font-size:14px;font-weight:700">{sig.get('close_pos',0)*100:.0f}%</div>
+  </div>
+  <div style="margin-bottom:8px">
+    <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">
+      <span style="color:#5a6580">評分</span>
+      <span><b style="color:{bar_col}">{score}/{max_sc}</b> ({pct}%)</span>
     </div>
-    <div style="text-align:center">
-      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">漲幅</div>
-      <div style="font-size:16px;font-weight:700;color:{'#00d4aa' if sig['ret']>0 else '#ff4560'}">{sig['ret']*100:+.2f}%</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">量倍數 (20日均)</div>
-      <div style="font-size:16px;font-weight:700;color:{'#00d4aa' if sig['vol_ratio']>=2 else '#ffd166' if sig['vol_ratio']>=1.5 else '#e8edf5'}">{sig['vol_ratio']:.2f}x</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">收盤位置</div>
-      <div style="font-size:16px;font-weight:700">{sig.get('close_pos',0)*100:.0f}%</div>
-    </div>
-    <div style="text-align:center">
-      <div style="font-size:10px;color:#5a6580;margin-bottom:4px">跳空</div>
-      <div style="font-size:16px;font-weight:700;color:{'#00d4aa' if sig.get('gap',0)>0.01 else '#e8edf5'}">{sig.get('gap',0)*100:+.2f}%</div>
+    <div style="height:6px;background:#1e2535;border-radius:3px">
+      <div style="height:6px;width:{pct}%;background:{bar_col};border-radius:3px"></div>
     </div>
   </div>
-  <div>
-    <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px">
-      <span style="color:#5a6580">{sig.get('bt_mode','')}</span>
-      <span><b style="color:{bar_col}">{score}</b> / {max_sc} 分 ({pct}%)</span>
-    </div>
-    <div style="height:8px;background:#1e2535;border-radius:4px">
-      <div style="height:8px;width:{pct}%;background:{bar_col};border-radius:4px"></div>
-    </div>
+  <div style="border-top:1px solid #1e2535;padding-top:8px">
+    {cond_html}
   </div>
+  {"<div style='margin-top:8px;font-size:10px;color:#5a6580'>"+hold_str+"</div>" if hold_str else ""}
 </div>
 """, unsafe_allow_html=True)
 
-                # ── 條件明細 ─────────────────────────────────────────────────
-                conds = sig.get("conditions", [])
-                active_conds   = [c for c in conds if isinstance(c, dict) and c.get("active")]
-                inactive_conds = [c for c in conds if isinstance(c, dict) and not c.get("active")]
-
-                if active_conds:
-                    st.markdown("**📋 評分條件明細**")
-                    col_a, col_b = st.columns(2)
-                    for i, c in enumerate(active_conds):
-                        col = col_a if i % 2 == 0 else col_b
-                        passed_color = "#00d4aa" if c["passed"] else "#ff4560"
-                        pts_str = f"+{c['pts']}分" if c["passed"] else f"未達標 (0/{c['pts']}分)"
-                        col.markdown(
-                            f"<div style='background:rgba(0,0,0,0.25);border-left:3px solid {passed_color};"
-                            f"border-radius:4px;padding:8px 10px;margin:3px 0;font-size:12px'>"
-                            f"<div style='font-weight:600;margin-bottom:3px'>{c['text']}</div>"
-                            f"<div style='display:flex;justify-content:space-between;color:#8892a4'>"
-                            f"<span>📌 {c['value']}</span>"
-                            f"<span style='color:{passed_color};font-weight:600'>{pts_str}</span>"
-                            f"</div></div>",
-                            unsafe_allow_html=True
-                        )
-
-                if inactive_conds:
-                    with st.expander(f"⬜ 預測力不足，未參與評分（{len(inactive_conds)} 個）"):
-                        for c in inactive_conds:
-                            st.caption(f"{c['text']}　📌 {c['value']}")
-
-                # 觸發 / 接近觸發 提示
-                if trig:
-                    hs = bt_res.get("horizon_stats", {})
-                    best_hd_rt = ""
-                    if hs:
-                        best_hd = max(hs, key=lambda k: hs[k]["平均漲幅"])
-                        best_hd_rt = (f"最優持倉 {best_hd}，"
-                                      f"歷史均漲 {hs[best_hd]['平均漲幅']}%，"
-                                      f"勝率 {hs[best_hd]['勝率']}%")
-                    st.success(f"📱 已/將發送 Telegram｜{best_hd_rt}")
-                elif pct >= 50:
-                    missing = [c["text"].replace("❌ ","") for c in active_conds if not c.get("passed")]
-                    if missing:
-                        st.info(f"🔜 距觸發還差：{' · '.join(missing[:3])}")
-
         # ══════════════════════════════════════════════════════════════════════
-        #  🤖 AI 分析對話區（Groq llama-3.3-70b）
+        #  個股詳細分析（可展開）
         # ══════════════════════════════════════════════════════════════════════
         st.divider()
+        st.markdown("### 🔍 個股詳細分析")
+
+        selected_detail = st.selectbox(
+            "選擇查看詳細回測結果",
+            done_tickers, key="detail_ticker"
+        )
+
+        if selected_detail:
+            sp_ticker = selected_detail
+            bt_res = st.session_state[f"sp_result_{sp_ticker}"]
+            surge_pts = bt_res.get("surge_points", [])
+            pwr_data  = bt_res.get("feature_power", [])
+            pwr_df    = pd.DataFrame(pwr_data) if pwr_data else pd.DataFrame()
+            tr = bt_res.get("train_result", {})
+            te = bt_res.get("test_result",  {})
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("總K線數",    bt_res["total_bars"])
+            m2.metric("爆升點數",   len(surge_pts), f"定義:{sp_days}天漲>{sp_surge}%")
+            m3.metric("特徵分析數", len(pwr_df) if not pwr_df.empty else 0)
+            m4.metric("訓練集樣本", tr.get("樣本數", 0), f"前{int(sp_train*100)}%")
+            m5.metric("測試集樣本", te.get("樣本數", 0), f"後{int((1-sp_train)*100)}%")
+
+            detail_tab1, detail_tab2, detail_tab3, detail_tab4, detail_tab5 = st.tabs([
+                "🏆 特徵預測力", "📈 過程特徵", "📊 量能分層", "⏱️ 持倉天數", "🌍 環境+財報+驗證"
+            ])
+
+            with detail_tab1:
+                if not pwr_df.empty:
+                    def _color_lift(val):
+                        try:
+                            v = float(val)
+                            if v >= 2.5: return "background-color:#0d3b1e;color:#00d4aa"
+                            if v >= 1.5: return "background-color:#1a2e0d;color:#7ec850"
+                            if v >= 1.2: return "background-color:#2a2200;color:#ffd166"
+                            return "background-color:#2a0d0d;color:#ff4560"
+                        except: return ""
+                    styled = pwr_df.style.map(_color_lift, subset=["預測力倍數"])
+                    st.dataframe(styled, use_container_width=True, hide_index=True)
+                    fig_pwr = go.Figure(go.Bar(
+                        x=pwr_df["預測力倍數"], y=pwr_df["特徵"], orientation="h",
+                        marker_color=["#00d4aa" if v>=2 else "#ffd166" if v>=1.5 else "#ff4560"
+                                      for v in pwr_df["預測力倍數"]],
+                        text=[f"{v:.1f}x" for v in pwr_df["預測力倍數"]],
+                        textposition="outside",
+                    ))
+                    fig_pwr.add_vline(x=1.0, line_dash="dash", line_color="gray")
+                    fig_pwr.add_vline(x=2.0, line_dash="dash", line_color="#00d4aa")
+                    fig_pwr.update_layout(
+                        title=f"{sp_ticker} 特徵預測力",
+                        template="plotly_dark", height=400,
+                        margin=dict(l=200,r=60,t=40,b=40),
+                    )
+                    st.plotly_chart(fig_pwr, use_container_width=True, key=f"pwr_{sp_ticker}")
+
+            with detail_tab2:
+                ps = bt_res.get("process_stats", {})
+                if ps:
+                    ps_rows = [{"過程特徵": k, **v} for k, v in ps.items()]
+                    st.dataframe(pd.DataFrame(ps_rows), use_container_width=True, hide_index=True)
+
+            with detail_tab3:
+                ls = bt_res.get("layer_stats", {})
+                if ls:
+                    ls_rows = [{"量能等級": k, **v} for k, v in ls.items()]
+                    ls_df = pd.DataFrame(ls_rows)
+                    col_l, col_r = st.columns(2)
+                    with col_l:
+                        st.dataframe(ls_df, use_container_width=True, hide_index=True)
+                    with col_r:
+                        fig_ls = go.Figure(go.Bar(
+                            x=[r["量能等級"] for r in ls_rows],
+                            y=[r["爆升率"] for r in ls_rows],
+                            marker_color="#00d4aa",
+                            text=[f"{r['爆升率']}%" for r in ls_rows],
+                            textposition="outside",
+                        ))
+                        fig_ls.update_layout(template="plotly_dark", height=280,
+                                             margin=dict(t=20,b=20))
+                        st.plotly_chart(fig_ls, use_container_width=True, key=f"ls_{sp_ticker}")
+
+            with detail_tab4:
+                hs = bt_res.get("horizon_stats", {})
+                if hs:
+                    hs_rows = [{"持倉天數": k, **v} for k, v in hs.items()]
+                    hs_df   = pd.DataFrame(hs_rows)
+                    best_hd = max(hs, key=lambda k: hs[k]["平均漲幅"])
+                    col_h1, col_h2 = st.columns(2)
+                    with col_h1:
+                        st.dataframe(hs_df, use_container_width=True, hide_index=True)
+                        st.success(f"🏆 最優持倉：{best_hd}（均漲{hs[best_hd]['平均漲幅']}%，勝率{hs[best_hd]['勝率']}%）")
+                    with col_h2:
+                        fig_hs = go.Figure(go.Bar(
+                            x=list(hs.keys()),
+                            y=[v["平均漲幅"] for v in hs.values()],
+                            marker_color="#7c5cfc",
+                            text=[f"{v['平均漲幅']}%" for v in hs.values()],
+                            textposition="outside",
+                        ))
+                        fig_hs.update_layout(template="plotly_dark", height=280,
+                                             margin=dict(t=20,b=20))
+                        st.plotly_chart(fig_hs, use_container_width=True, key=f"hs_{sp_ticker}")
+
+            with detail_tab5:
+                col_j, col_l = st.columns(2)
+                with col_j:
+                    st.markdown("**🌍 大市環境分層**")
+                    rs = bt_res.get("regime_stats", {})
+                    if rs:
+                        rs_rows = [{"環境": k, **v} for k, v in rs.items()]
+                        st.dataframe(pd.DataFrame(rs_rows), use_container_width=True, hide_index=True)
+                with col_l:
+                    st.markdown("**📅 財報週影響**")
+                    ei = bt_res.get("earnings_impact", {})
+                    if ei:
+                        st.metric("財報週爆升次數",   ei.get("財報週爆升次數", 0))
+                        st.metric("非財報週爆升次數", ei.get("非財報週爆升次數", 0))
+                        st.metric("財報週佔比",       f"{ei.get('財報週佔比', 0)}%")
+                        if ei.get("財報週佔比", 0) > 30:
+                            st.warning("⚠️ 超過30%的爆升在財報週，量能信號需額外謹慎")
+                        else:
+                            st.success("✅ 財報週影響有限，量能信號相對可靠")
+
+                st.divider()
+                st.markdown("**🔬 訓練集 vs 測試集驗證**")
+                if tr and te:
+                    st.dataframe(pd.DataFrame([tr, te]), use_container_width=True, hide_index=True)
+                    te_n = te.get("樣本數", 0)
+                    if te_n == 0:
+                        st.warning("⚠️ 測試集樣本不足")
+                    else:
+                        st.success("✅ 訓練集與測試集分布均衡，規律相對可靠")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  🤖 AI 分析對話（多股版：可選擇對哪隻股票問問題）
+    # ══════════════════════════════════════════════════════════════════════════
+    if done_tickers:
+        st.divider()
         st.markdown("### 🤖 AI 分析對話")
-        st.caption("回測數據已自動注入，直接問問題即可 · 由 Groq llama-3.3-70b 驅動")
+        st.caption("選擇股票，回測數據自動注入，直接問問題 · 由 Groq llama-3.3-70b 驅動")
 
         if not groq_ready:
             st.warning("⚠️ 請在 Streamlit secrets 加入 `[groq] GROQ_API_KEY = 'your_key'`")
 
-        # ── 語言選擇（唯一設定）──────────────────────────────────────────────
-        ai_lang = st.selectbox(
-            "回覆語言", ["繁體中文", "简体中文", "English"],
-            key="ai_lang"
-        )
+        ai_c1, ai_c2 = st.columns([2, 2])
+        with ai_c1:
+            ai_target = st.selectbox("問哪隻股票", done_tickers, key="ai_target")
+        with ai_c2:
+            ai_lang = st.selectbox("回覆語言", ["繁體中文", "简体中文", "English"], key="ai_lang")
 
-        # ── 自動生成回測摘要 ──────────────────────────────────────────────────
-        def _build_bt_summary(bt, ticker):
-            if not bt or bt.get("error"):
-                return f"{ticker} 尚未完成回測"
-            lines = [f"=== {ticker} 回測數據摘要 ==="]
-            lines.append(f"回測K線數: {bt.get('total_bars', 0)}")
-            lines.append(f"爆升點數量: {len(bt.get('surge_points', []))}")
-            pwr = bt.get("feature_power", [])
-            if pwr:
-                lines.append("\n【特徵預測力排行 Top5】")
-                for row in pwr[:5]:
-                    lines.append(f"  {row['特徵']}: {row['預測力倍數']}x (爆升前{row['爆升前出現率']}% vs 非爆升{row['非爆升出現率']}%)")
-            ps = bt.get("process_stats", {})
-            if ps:
-                lines.append("\n【過程特徵統計】")
-                for name, vals in ps.items():
-                    lines.append(f"  {name}: 爆升前{vals.get('爆升前出現率','N/A')} vs 非爆升{vals.get('非爆升出現率','N/A')}")
-            ls = bt.get("layer_stats", {})
-            if ls:
-                lines.append("\n【成交量分層爆升率】")
-                for layer, v in ls.items():
-                    lines.append(f"  {layer}: 爆升率{v['爆升率']}% ({v['爆升次數']}次)")
-            hs = bt.get("horizon_stats", {})
-            if hs:
-                lines.append("\n【最優持倉天數】")
-                for hd, v in hs.items():
-                    lines.append(f"  {hd}: 均漲{v['平均漲幅']}%, 勝率{v['勝率']}%")
-            rs = bt.get("regime_stats", {})
-            if rs:
-                lines.append("\n【大市環境分層】")
-                for regime, v in rs.items():
-                    lines.append(f"  {regime}: 爆升率{v['爆升率']}% ({v['爆升次數']}次)")
-            ei = bt.get("earnings_impact", {})
-            if ei:
-                lines.append(f"\n【財報週佔比】{ei.get('財報週佔比','N/A')}%")
-            tr = bt.get("train_result", {})
-            te = bt.get("test_result", {})
-            if tr and te:
-                lines.append(f"\n【訓練集】樣本{tr.get('樣本數',0)}, 量能遞進{tr.get('量能遞進','N/A')}, 底部抬升{tr.get('底部抬升','N/A')}")
-                lines.append(f"【測試集】樣本{te.get('樣本數',0)}, 量能遞進{te.get('量能遞進','N/A')}, 底部抬升{te.get('底部抬升','N/A')}")
-            return "\n".join(lines)
-
-        # ── 預設 Prompt 快捷按鈕 ──────────────────────────────────────────────
-        st.markdown("**💡 預設問題（一鍵發送）**")
+        # 預設問題
         preset_prompts = {
-            "📊 整體解讀":    "根據以上回測數據，幫我解讀 {ticker} 的爆升前信號特徵，哪些最可靠？哪些要小心？",
-            "🔍 最佳進場":    "根據回測數據，{ticker} 最佳的進場條件是什麼？請給出具體量化條件組合。",
-            "⚠️ 風險評估":    "根據回測數據，這套信號有哪些風險？什麼市場環境最容易失效？",
-            "📈 持倉策略":    "根據最優持倉天數和大市環境，幫我制定 {ticker} 的持倉和止損策略。",
-            "🔬 過擬合評估":  "訓練集和測試集的數據是否一致？這套規律是真實的還是歷史過擬合？",
-            "💰 實盤建議":    "如果要用這套系統實盤交易 {ticker}，資金管理和風控怎麼設置？",
+            "📊 整體解讀":   "根據以上回測數據，幫我解讀 {ticker} 的爆升前信號特徵，哪些最可靠？哪些要小心？",
+            "🔍 最佳進場":   "根據回測數據，{ticker} 最佳的進場條件是什麼？請給出具體量化條件組合。",
+            "⚠️ 風險評估":   "根據回測數據，這套信號有哪些風險？什麼市場環境最容易失效？",
+            "📈 持倉策略":   "根據最優持倉天數和大市環境，幫我制定 {ticker} 的持倉和止損策略。",
+            "🔬 過擬合評估": "訓練集和測試集的數據是否一致？這套規律是真實的還是歷史過擬合？",
+            "💰 實盤建議":   "如果要實盤交易 {ticker}，資金管理和風控怎麼設置？",
         }
         btn_cols = st.columns(3)
         for i, (label, tmpl) in enumerate(preset_prompts.items()):
             with btn_cols[i % 3]:
                 if st.button(label, key=f"preset_{i}", use_container_width=True):
-                    st.session_state["ai_pending_prompt"] = tmpl.format(ticker=sp_ticker)
+                    st.session_state["ai_pending_prompt"] = tmpl.format(ticker=ai_target)
 
-        # ── 對話管理 ──────────────────────────────────────────────────────────
         if "ai_chat_history" not in st.session_state:
             st.session_state["ai_chat_history"] = []
-
         if st.button("🗑️ 清空對話", key="ai_clear"):
             st.session_state["ai_chat_history"] = []
             st.session_state.pop("ai_pending_prompt", None)
             st.rerun()
 
-        # ── 顯示對話歷史 ──────────────────────────────────────────────────────
         for msg in st.session_state["ai_chat_history"]:
-            with st.chat_message(msg["role"], avatar="🤖" if msg["role"] == "assistant" else "👤"):
+            with st.chat_message(msg["role"], avatar="🤖" if msg["role"]=="assistant" else "👤"):
                 st.markdown(msg["content"])
 
-        # ── 輸入框 ────────────────────────────────────────────────────────────
-        pending    = st.session_state.pop("ai_pending_prompt", None)
-        user_input = st.chat_input("直接問 AI（回測數據已自動注入）", key="ai_chat_input")
+        pending     = st.session_state.pop("ai_pending_prompt", None)
+        user_input  = st.chat_input("直接問 AI（回測數據已自動注入）", key="ai_chat_input")
         final_input = pending or user_input
 
         if final_input:
-            st.session_state["ai_chat_history"].append({"role": "user", "content": final_input})
+            st.session_state["ai_chat_history"].append({"role":"user","content":final_input})
             with st.chat_message("user", avatar="👤"):
                 st.markdown(final_input)
 
-            # System prompt（含回測數據）
-            lang_map = {"繁體中文": "請用繁體中文回覆", "简体中文": "请用简体中文回复", "English": "Please reply in English"}
-            bt_summary = _build_bt_summary(st.session_state.get(f"sp_result_{sp_ticker}"), sp_ticker)
+            lang_map = {"繁體中文":"請用繁體中文回覆","简体中文":"请用简体中文回复","English":"Please reply in English"}
+            bt_summary = _build_bt_summary(st.session_state.get(f"sp_result_{ai_target}"), ai_target)
             system_prompt = f"""你是一位專業的量化交易分析師，專注於股票量價信號分析。
-{lang_map.get(st.session_state.get("ai_lang","繁體中文"), "請用繁體中文回覆")}
+{lang_map.get(st.session_state.get('ai_lang','繁體中文'),'請用繁體中文回覆')}
 
-以下是 {sp_ticker} 的完整回測數據，請基於這些數據回答問題：
+以下是 {ai_target} 的完整回測數據：
 
 {bt_summary}
 
 分析原則：基於數據說話，給出具體數字；指出優勢和局限；結合大市環境；提醒財報週特殊性；誠實評估過擬合風險。"""
 
-            api_messages = [{"role": m["role"], "content": m["content"]}
+            api_messages = [{"role":m["role"],"content":m["content"]}
                             for m in st.session_state["ai_chat_history"][:-1]]
-            api_messages.append({"role": "user", "content": final_input})
+            api_messages.append({"role":"user","content":final_input})
 
             with st.chat_message("assistant", avatar="🤖"):
                 placeholder = st.empty()
                 full_reply  = ""
-                # Groq-only: key from secrets
-
                 if not groq_ready:
-                    full_reply = "⚠️ Groq API Key 未設定，請在 secrets.toml 加入 [groq] GROQ_API_KEY"
+                    full_reply = "⚠️ Groq API Key 未設定"
                     placeholder.warning(full_reply)
                 else:
                     try:
-                        headers = {
-                            "Authorization": f"Bearer {GROQ_API_KEY}",
-                            "Content-Type":  "application/json",
-                        }
-                        payload = {
-                            "model":       "llama-3.3-70b-versatile",
-                            "temperature": 0.3,
-                            "max_tokens":  2048,
-                            "stream":      True,
-                            "messages":    [
-                                {"role": "system", "content": system_prompt},
-                                *api_messages,
-                            ],
-                        }
+                        headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
+                                   "Content-Type": "application/json"}
+                        payload = {"model": "llama-3.3-70b-versatile",
+                                   "temperature": 0.3, "max_tokens": 2048,
+                                   "stream": True,
+                                   "messages": [{"role":"system","content":system_prompt}]+api_messages}
                         with requests.post(
                             "https://api.groq.com/openai/v1/chat/completions",
-                            headers=headers, json=payload,
-                            stream=True, timeout=60
+                            headers=headers, json=payload, stream=True, timeout=60
                         ) as resp:
                             if resp.status_code != 200:
-                                raise Exception(f"Groq API {resp.status_code}: {resp.text[:300]}")
+                                raise Exception(f"Groq {resp.status_code}: {resp.text[:300]}")
                             for line in resp.iter_lines():
-                                if not line:
-                                    continue
+                                if not line: continue
                                 s = line.decode("utf-8")
                                 if s.startswith("data: ") and s[6:].strip() != "[DONE]":
                                     try:
-                                        delta = json.loads(s[6:])["choices"][0]["delta"].get("content", "")
+                                        delta = json.loads(s[6:])["choices"][0]["delta"].get("content","")
                                         full_reply += delta
                                         placeholder.markdown(full_reply + "▌")
-                                    except Exception:
-                                        continue
+                                    except: continue
                         placeholder.markdown(full_reply)
-
                     except Exception as e:
                         full_reply = f"❌ Groq 調用失敗：{e}"
                         placeholder.error(full_reply)
 
                 if full_reply:
-                    st.session_state["ai_chat_history"].append({"role": "assistant", "content": full_reply})
+                    st.session_state["ai_chat_history"].append({"role":"assistant","content":full_reply})
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  AUTO REFRESH（使用 @st.fragment 實現非阻塞自動刷新）
