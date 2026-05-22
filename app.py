@@ -3409,6 +3409,73 @@ def _realtime_check(ticker: str, bt_result: dict,
 
 
 # ── Telegram 推送（個股化版本）───────────────────────────────────────────────
+def _build_bt_summary(bt: dict, ticker: str) -> str:
+    """把回測結果濃縮成 AI 可讀的文字摘要，自動注入 system prompt。"""
+    if not bt or bt.get("error"):
+        return f"{ticker} 尚未完成回測"
+    lines = [f"=== {ticker} 回測數據摘要 ==="]
+    lines.append(f"回測K線數: {bt.get('total_bars', 0)}")
+    lines.append(f"爆升點數量: {len(bt.get('surge_points', []))}")
+
+    pwr = bt.get("feature_power", [])
+    if pwr:
+        lines.append("\n【特徵預測力排行 Top5】")
+        for row in pwr[:5]:
+            lines.append(
+                f"  {row['特徵']}: 預測力{row['預測力倍數']}x "
+                f"(爆升前{row['爆升前出現率']}% vs 非爆升{row['非爆升出現率']}%)"
+            )
+
+    ps = bt.get("process_stats", {})
+    if ps:
+        lines.append("\n【過程特徵統計】")
+        for name, vals in ps.items():
+            lines.append(
+                f"  {name}: 爆升前{vals.get('爆升前出現率','N/A')} "
+                f"vs 非爆升{vals.get('非爆升出現率','N/A')}"
+            )
+
+    ls = bt.get("layer_stats", {})
+    if ls:
+        lines.append("\n【成交量分層爆升率】")
+        for layer, v in ls.items():
+            lines.append(f"  {layer}: 爆升率{v['爆升率']}% ({v['爆升次數']}次)")
+
+    hs = bt.get("horizon_stats", {})
+    if hs:
+        lines.append("\n【最優持倉天數】")
+        for hd, v in hs.items():
+            lines.append(f"  {hd}: 均漲{v['平均漲幅']}%, 勝率{v['勝率']}%")
+
+    rs = bt.get("regime_stats", {})
+    if rs:
+        lines.append("\n【大市環境分層】")
+        for regime, v in rs.items():
+            lines.append(
+                f"  {regime}: 爆升率{v['爆升率']}% ({v['爆升次數']}次)"
+            )
+
+    ei = bt.get("earnings_impact", {})
+    if ei:
+        lines.append(f"\n【財報週佔比】{ei.get('財報週佔比','N/A')}%")
+
+    tr = bt.get("train_result", {})
+    te = bt.get("test_result",  {})
+    if tr and te:
+        lines.append(
+            f"\n【訓練集】樣本{tr.get('樣本數',0)}, "
+            f"量能遞進{tr.get('量能遞進','N/A')}, "
+            f"底部抬升{tr.get('底部抬升','N/A')}"
+        )
+        lines.append(
+            f"【測試集】樣本{te.get('樣本數',0)}, "
+            f"量能遞進{te.get('量能遞進','N/A')}, "
+            f"底部抬升{te.get('底部抬升','N/A')}"
+        )
+
+    return "\n".join(lines)
+
+
 def _build_surge_tg_msg(sig: dict, bt: dict) -> str:
     ticker  = sig["ticker"]
     now     = sig["time"].strftime("%Y-%m-%d %H:%M")
